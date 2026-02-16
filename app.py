@@ -22,6 +22,7 @@ from src.drug_pairs import get_offline_pairs, OFFLINE_PAIRS
 from src.query_generator import generate_queries, save_queries
 from src.response_analyzer import analyze_response, analyze_all_responses
 from src.cima_client import CIMAClient
+from src.rag_engine import collect_all_responses as rag_collect
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -246,8 +247,8 @@ elif page == "3. Download Prospectos":
 elif page == "4. Collect Responses":
     st.header("Collect MeQA Responses")
     st.markdown(
-        "Upload responses collected from the MeQA system. "
-        "You can upload individual JSON files or a bulk CSV."
+        "Generate responses automatically using a RAG pipeline "
+        "(prospectos + LLM), or upload manually collected responses."
     )
 
     resp_count = load_responses_count()
@@ -264,8 +265,90 @@ elif page == "4. Collect Responses":
 
     st.markdown("---")
 
-    # Upload bulk CSV
-    st.subheader("Upload Responses (CSV)")
+    # ── Automated RAG collection ──
+    st.subheader("Automated Collection (RAG)")
+    st.markdown(
+        "Uses downloaded prospectos as context and an OpenAI model to generate "
+        "responses that simulate the MeQA system. Requires an OpenAI API key "
+        "configured in **Streamlit secrets** (`OPENAI_API_KEY`)."
+    )
+
+    # Check for API key
+    api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
+    if not api_key:
+        api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
+        )
+
+    prospecto_count = len(list(PROSPECTOS_DIR.glob("*.json"))) - (
+        1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
+    )
+
+    model = st.selectbox(
+        "Model",
+        ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
+        index=0,
+        help="gpt-4o-mini is recommended (fast and cost-effective).",
+    )
+
+    skip_existing = st.checkbox("Skip already-collected responses", value=True)
+
+    if prospecto_count > 0:
+        st.info(f"**{prospecto_count}** prospectos available as RAG context.")
+    else:
+        st.warning(
+            "No prospectos downloaded yet. The model will answer from general "
+            "pharmaceutical knowledge. For better results, run **Step 3** first."
+        )
+
+    if not api_key:
+        st.info("Enter your OpenAI API key above to enable automated collection.")
+    elif total_queries == 0:
+        st.warning("No query battery found. Run **Step 2** first.")
+    else:
+        if st.button("Run RAG Collection", type="primary"):
+            queries_json = QUERIES_DIR / "query_battery.json"
+            with open(queries_json, encoding="utf-8") as f:
+                queries_list = json.load(f)
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            def update_progress(current, total):
+                progress_bar.progress(current / total)
+                status_text.text(f"Processing query {current}/{total}...")
+
+            try:
+                collected = rag_collect(
+                    queries=queries_list,
+                    api_key=api_key,
+                    model=model,
+                    prospectos_dir=PROSPECTOS_DIR,
+                    responses_dir=RESPONSES_DIR,
+                    delay=0.3,
+                    progress_callback=update_progress,
+                    skip_existing=skip_existing,
+                )
+                progress_bar.empty()
+                status_text.empty()
+                new_count = len(collected)
+                total_now = load_responses_count()
+                st.success(
+                    f"Collected **{new_count}** new responses. "
+                    f"Total: **{total_now}/{total_queries}**"
+                )
+                st.rerun()
+            except Exception as e:
+                progress_bar.empty()
+                status_text.empty()
+                st.error(f"Error during RAG collection: {e}")
+
+    st.markdown("---")
+
+    # ── Manual upload: CSV ──
+    st.subheader("Manual Upload (CSV)")
     st.markdown(
         "Upload a CSV with columns `query_id` and `response_text`. "
         "Each row will be saved as an individual response file."
@@ -309,7 +392,7 @@ elif page == "4. Collect Responses":
 
     st.markdown("---")
 
-    # Upload individual JSON files
+    # ── Manual upload: JSON ──
     st.subheader("Upload Individual Responses (JSON)")
     json_files = st.file_uploader(
         "Upload Q*.json files", type=["json"], accept_multiple_files=True
@@ -328,7 +411,7 @@ elif page == "4. Collect Responses":
             st.success(f"Saved **{saved}** response files.")
             st.rerun()
 
-    # Show existing responses
+    # ── Show existing responses ──
     if resp_count > 0:
         st.markdown("---")
         st.subheader("Existing Responses")
