@@ -1,532 +1,499 @@
-"""RAG engine for automated MeQA response collection.
+"""RAG engine simulating the MeQA architecture.
 
-Implements the MeQA RAG architecture:
+Based on: Santamaría, J. (2021). "Medicines Question Answering System, MeQA"
+          AEMPS — arXiv:2111.02760
 
-  ┌─────────────┐
-  │  CIMA        │   1. INGESTION: Load prospecto JSONs, extract text,
-  │  Prospectos  │      clean HTML, split into semantic chunks
-  └──────┬───────┘
-         ▼
-  ┌─────────────┐
-  │  Chunking   │   2. CHUNKING: Recursive character splitting with
-  │  + Metadata  │      overlap; each chunk keeps source drug metadata
-  └──────┬───────┘
-         ▼
-  ┌─────────────┐
-  │  Embedding  │   3. EMBEDDING: OpenAI text-embedding-3-small encodes
-  │  Index      │      every chunk into a dense vector
-  └──────┬───────┘
-         ▼
-  ┌─────────────┐   4. QUERY PROCESSING: Classify query intent, pre-filter
-  │  Query      │      by drug name, embed the query
-  │  Processor  ├─┐
-  └─────────────┘ │
-         ▼        │
-  ┌─────────────┐ │ 5. RETRIEVAL: Cosine similarity search over the
-  │  Retriever  │◀┘    pre-filtered chunk index → top-k relevant chunks
-  └──────┬───────┘
-         ▼
-  ┌─────────────┐
-  │  Context    │   6. CONTEXT ASSEMBLY: Deduplicate, rank by score,
-  │  Assembly   │      format into prompt with source citations
-  └──────┬───────┘
-         ▼
-  ┌─────────────┐
-  │  LLM        │   7. GENERATION: System prompt (MeQA persona) +
-  │  Generation │      assembled context + user query → response
-  └──────┬───────┘
-         ▼
-  ┌─────────────┐
-  │  Response   │   8. POST-PROCESSING: Validate non-empty, add metadata
-  │  Formatting │      (model, timestamp, context used), save as JSON
-  └─────────────┘
+Real MeQA has three processing blocks:
+
+  Block 1 — Question Processing
+    Normalization → NER (medicine names, doses, pharma forms via CIMA/UMLS)
+    → bi-LSTM section prediction (6 leaflet sections, sigmoid, 6 outputs)
+
+  Block 2 — Leaflets & Sections Extraction
+    TF-IDF leaflet selection → VSM/LSI additional-section extraction
+
+  Block 3 — Answer Extraction
+    Sentence extraction from predicted sections → dedup → add context
+    → rank by relevance → main answer + additional information
+
+Our simulation maps these blocks onto a modern LangChain RAG pipeline:
+
+  Block 1 → query_normalise + extract_entities + predict_sections
+  Block 2 → Hybrid retrieval: BM25 (sparse, ≈ TF-IDF) + FAISS (dense)
+            with section-aware filtering
+  Block 3 → Context assembly (extract, dedup, section headers)
+            + LLM generation with extractive instructions
 """
 
 import json
-import math
+import os
 import pickle
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
-from openai import OpenAI
+from langchain_core.documents import Document
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 
 from .config import PROSPECTOS_DIR, RESPONSES_DIR, DATA_DIR
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. DOCUMENT INGESTION — Load and clean prospecto text
+# BLOCK 1 — QUESTION PROCESSING
+# (Simulates MeQA's Normalization + NER + bi-LSTM section prediction)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The 6 standard leaflet sections (same structure for ALL Spanish prospectos)
+LEAFLET_SECTIONS = {
+    1: "Qué es y para qué se utiliza",
+    2: "Qué necesita saber antes de empezar a tomar",
+    3: "Cómo tomar",
+    4: "Posibles efectos adversos",
+    5: "Conservación",
+    6: "Contenido del envase e información adicional",
+}
+
+# Section prediction: maps query_category → predicted leaflet section numbers.
+# This simulates the bi-LSTM model trained on 13,989 Doctoralia questions
+# that predicts which sections contain the answer (sigmoid over 6 outputs).
+SECTION_PREDICTION: dict[str, list[int]] = {
+    "indication":          [1],
+    "adverse_effects":     [4],
+    "pregnancy":           [2],
+    "dosage":              [3],
+    "driving":             [2],
+    "contraindications":   [2],
+    "storage":             [5],
+    "alcohol":             [2, 3],
+    "food":                [2, 3],
+    "equivalence":         [1, 6],
+    "recommendation":      [1, 2],
+    "switching":           [1, 6],
+}
+
+# Keywords for section identification in prospecto text
+_SECTION_PATTERNS: dict[int, list[str]] = {
+    1: ["qué es", "para qué se utiliza", "para qué sirve", "indicacion", "indicado"],
+    2: ["antes de tomar", "antes de usar", "antes de que le administren",
+        "no tome", "no use", "advertencia", "precaucion", "embarazo",
+        "lactancia", "conduccion", "conducir", "otros medicamentos"],
+    3: ["cómo tomar", "cómo usar", "dosis", "posología",
+        "si toma más", "si olvidó", "si olvida"],
+    4: ["efectos adversos", "efectos secundarios", "efectos no deseados",
+        "reacciones adversas", "frecuentes", "poco frecuentes", "raros"],
+    5: ["conservación", "conservar", "almacenar", "caducidad",
+        "no utilice después", "desechar"],
+    6: ["contenido del envase", "composición", "aspecto del producto",
+        "información adicional", "titular de la autorización"],
+}
+
+
+def normalise_query(text: str) -> str:
+    """MeQA Block 1 — Normalization module.
+
+    Lowercase, strip accents, remove irrelevant punctuation, collapse whitespace.
+    Mirrors the real MeQA normalization step.
+    """
+    text = text.lower().strip()
+    # Remove accents (as the real MeQA does)
+    nfkd = unicodedata.normalize("NFKD", text)
+    text_no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+    # Keep ñ (restore it since it's not an accent)
+    text_no_accents = text_no_accents.replace("n\u0303", "ñ")
+    # Remove irrelevant punctuation but keep ? and basic structure
+    text_clean = re.sub(r"[^\w\s¿?.,]", " ", text_no_accents)
+    return re.sub(r"\s+", " ", text_clean).strip()
+
+
+def extract_entities(query: dict) -> dict:
+    """MeQA Block 1 — Simplified NER module.
+
+    Extracts medicine name, active ingredient, dose, and pharma form
+    from the structured query metadata. The real MeQA uses maximum
+    coincidence with n-grams + CIMA REST + SpaCy dependency parsing.
+    """
+    drug_name = query.get("drug_name", "")
+    principio = query.get("principio_activo", "")
+
+    # Extract dose pattern (e.g., "20 mg", "600 mg", "100 mcg")
+    dose_match = re.search(r"(\d+(?:[.,]\d+)?\s*(?:mg|mcg|g|ml|ui))", drug_name, re.I)
+    dose = dose_match.group(1) if dose_match else ""
+
+    # Extract pharmaceutical form
+    form_patterns = [
+        "comprimidos", "cápsulas", "capsulas", "solución oral", "solucion oral",
+        "sobres", "inyectable", "gel", "crema", "pomada", "gotas", "jarabe",
+        "comprimidos recubiertos", "cápsulas duras", "capsulas duras",
+        "comprimidos recubiertos con película", "polvo",
+    ]
+    form = ""
+    name_lower = drug_name.lower()
+    for fp in sorted(form_patterns, key=len, reverse=True):
+        if fp in name_lower:
+            form = fp
+            break
+
+    return {
+        "medicine_name": drug_name,
+        "active_ingredient": principio,
+        "dose": dose,
+        "pharma_form": form,
+        "is_generic": query.get("is_generic", ""),
+    }
+
+
+def predict_sections(query_category: str) -> list[int]:
+    """MeQA Block 1 — Section prediction (simulates bi-LSTM).
+
+    The real MeQA uses a bi-LSTM with learned embeddings → 6 sigmoid
+    outputs, trained on 13,989 annotated questions from Doctoralia.
+    We approximate this with a deterministic mapping from query category
+    to likely leaflet sections.
+
+    Returns list of predicted section numbers (1-6).
+    """
+    return SECTION_PREDICTION.get(query_category, [1, 2, 4])
+
+
+def classify_section(text: str) -> int:
+    """Classify a text chunk into the most likely leaflet section number."""
+    text_lower = text.lower()[:500]
+    best_section = 0
+    best_score = 0
+    for sec_num, patterns in _SECTION_PATTERNS.items():
+        score = sum(1 for p in patterns if p in text_lower)
+        if score > best_score:
+            best_score = score
+            best_section = sec_num
+    return best_section
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DOCUMENT PROCESSING — Load prospectos, extract text, build LangChain Documents
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags and collapse whitespace."""
     clean = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", clean).strip()
 
 
-def _extract_sections(obj, depth: int = 0) -> list[dict]:
-    """Recursively extract titled sections from CIMA segmented documents.
-
-    Returns a flat list of {title, content, depth} dicts so each section
-    can be chunked independently while keeping its heading as metadata.
-    """
-    sections: list[dict] = []
+def _walk_and_extract(obj, depth: int = 0) -> list[dict]:
+    """Recursively extract {title, content} from CIMA segmented documents."""
+    results: list[dict] = []
 
     if isinstance(obj, str):
         text = _strip_html(obj)
         if text:
-            sections.append({"title": "", "content": text, "depth": depth})
-        return sections
+            results.append({"title": "", "content": text, "depth": depth})
+        return results
 
     if isinstance(obj, list):
         for item in obj:
-            sections.extend(_extract_sections(item, depth))
-        return sections
+            results.extend(_walk_and_extract(item, depth))
+        return results
 
     if isinstance(obj, dict):
         title = _strip_html(obj.get("titulo", obj.get("title", "")))
         content = obj.get("contenido", obj.get("content", ""))
 
         if content:
-            text = _strip_html(content) if isinstance(content, str) else ""
-            if text:
-                sections.append({"title": title, "content": text, "depth": depth})
+            if isinstance(content, str):
+                text = _strip_html(content)
+                if text:
+                    results.append({"title": title, "content": text, "depth": depth})
             elif isinstance(content, (list, dict)):
-                sub = _extract_sections(content, depth + 1)
+                sub = _walk_and_extract(content, depth + 1)
                 if sub and title:
-                    sub[0]["title"] = f"{title} > {sub[0]['title']}" if sub[0]["title"] else title
-                sections.extend(sub)
+                    sub[0]["title"] = (
+                        f"{title} > {sub[0]['title']}" if sub[0]["title"] else title
+                    )
+                results.extend(sub)
 
         for key in ("secciones", "sections", "subsecciones"):
             if key in obj:
-                sub = _extract_sections(obj[key], depth + 1)
-                sections.extend(sub)
+                results.extend(_walk_and_extract(obj[key], depth + 1))
 
-    return sections
+    return results
 
 
-def load_prospectos(prospectos_dir: Path = PROSPECTOS_DIR) -> list[dict]:
-    """Load all prospecto JSONs and return structured document list.
+def load_prospecto_documents(
+    prospectos_dir: Path = PROSPECTOS_DIR,
+    chunk_size: int = 500,
+    chunk_overlap: int = 80,
+) -> list[Document]:
+    """Load prospectos, extract text, chunk, and return LangChain Documents.
 
-    Each document: {nombre, nregistro, es_generico, sections: [{title, content}]}
+    Each Document has metadata: drug_name, nregistro, es_generico,
+    section_title, section_number (1-6).
     """
-    documents: list[dict] = []
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", ", ", " "],
+        length_function=len,
+    )
+
+    all_docs: list[Document] = []
+
     for fp in sorted(prospectos_dir.glob("*.json")):
         if fp.name == ".gitkeep":
             continue
+
         with open(fp, encoding="utf-8") as f:
             data = json.load(f)
 
+        drug_name = data.get("nombre", fp.stem)
+        nregistro = data.get("nregistro", "")
+        es_generico = data.get("es_generico", False)
+
         raw_sections = data.get("prospecto_sections", {})
-        sections = _extract_sections(raw_sections)
+        extracted = _walk_and_extract(raw_sections)
 
-        documents.append({
-            "nombre": data.get("nombre", fp.stem),
-            "nregistro": data.get("nregistro", ""),
-            "es_generico": data.get("es_generico", False),
-            "labtitular": data.get("labtitular", ""),
-            "sections": sections,
-            "filepath": str(fp),
-        })
-    return documents
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. CHUNKING — Split sections into overlapping text chunks
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _recursive_split(text: str, max_chars: int, overlap: int,
-                     separators: list[str] | None = None) -> list[str]:
-    """Split text recursively by trying progressively finer separators."""
-    if len(text) <= max_chars:
-        return [text]
-
-    if separators is None:
-        separators = ["\n\n", "\n", ". ", ", ", " "]
-
-    sep = separators[0] if separators else " "
-    remaining_seps = separators[1:] if len(separators) > 1 else []
-
-    parts = text.split(sep)
-    chunks: list[str] = []
-    current = ""
-
-    for part in parts:
-        candidate = f"{current}{sep}{part}" if current else part
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            # If a single part is still too big, split with finer separator
-            if len(part) > max_chars and remaining_seps:
-                sub_chunks = _recursive_split(part, max_chars, overlap, remaining_seps)
-                chunks.extend(sub_chunks)
-                current = ""
-            else:
-                current = part
-
-    if current:
-        chunks.append(current)
-
-    # Add overlap: prepend the tail of the previous chunk
-    if overlap > 0 and len(chunks) > 1:
-        overlapped = [chunks[0]]
-        for i in range(1, len(chunks)):
-            prev_tail = chunks[i - 1][-overlap:]
-            overlapped.append(prev_tail + " " + chunks[i])
-        chunks = overlapped
-
-    return chunks
-
-
-def chunk_documents(
-    documents: list[dict],
-    chunk_size: int = 500,
-    chunk_overlap: int = 100,
-) -> list[dict]:
-    """Split documents into chunks with metadata.
-
-    Returns list of:
-        {text, drug_name, nregistro, es_generico, section_title, chunk_idx}
-    """
-    all_chunks: list[dict] = []
-
-    for doc in documents:
-        drug_name = doc["nombre"]
-        chunk_idx = 0
-
-        for section in doc["sections"]:
+        for section in extracted:
             title = section.get("title", "")
             content = section.get("content", "")
             if not content.strip():
                 continue
 
-            # Prefix each chunk with its section heading for context
-            prefixed = f"{title}: {content}" if title else content
-            splits = _recursive_split(prefixed, chunk_size, chunk_overlap)
+            # Prefix text with section title for better retrieval
+            full_text = f"{title}: {content}" if title else content
+            section_num = classify_section(full_text)
 
-            for split_text in splits:
-                all_chunks.append({
-                    "text": split_text.strip(),
-                    "drug_name": drug_name,
-                    "drug_name_norm": _normalise(drug_name),
-                    "nregistro": doc.get("nregistro", ""),
-                    "es_generico": doc.get("es_generico", False),
-                    "section_title": title,
-                    "chunk_idx": chunk_idx,
-                })
-                chunk_idx += 1
+            chunks = splitter.split_text(full_text)
+            for chunk_text in chunks:
+                doc = Document(
+                    page_content=chunk_text,
+                    metadata={
+                        "drug_name": drug_name,
+                        "drug_name_lower": drug_name.lower(),
+                        "nregistro": nregistro,
+                        "es_generico": es_generico,
+                        "section_title": title,
+                        "section_number": section_num,
+                    },
+                )
+                all_docs.append(doc)
 
-    return all_chunks
+    return all_docs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. EMBEDDING & VECTOR INDEX — Encode chunks, store, and search
+# BLOCK 2 — LEAFLETS & SECTIONS EXTRACTION
+# (Hybrid retrieval: BM25 sparse ≈ TF-IDF + FAISS dense + section filtering)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIMS = 1536
-EMBED_BATCH_SIZE = 100  # OpenAI allows up to 2048 inputs per call
+FAISS_INDEX_DIR = DATA_DIR / "faiss_index"
 
 
-def embed_texts(texts: list[str], client: OpenAI) -> np.ndarray:
-    """Embed a list of texts using OpenAI embeddings API.
+def build_hybrid_retriever(
+    documents: list[Document],
+    api_key: str,
+    top_k: int = 8,
+    bm25_weight: float = 0.4,
+    dense_weight: float = 0.6,
+) -> tuple:
+    """Build BM25 + FAISS ensemble retriever.
 
-    Returns an (N, D) numpy array of normalised vectors.
+    This simulates MeQA's Block 2:
+    - BM25 ≈ TF-IDF-based leaflet/section matching (keyword precision)
+    - FAISS ≈ dense semantic matching (captures paraphrases)
+    - Ensemble combines both (like MeQA combining TF-IDF + VSM/LSI)
+
+    Returns (ensemble_retriever, faiss_store).
     """
-    all_embeddings: list[list[float]] = []
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        openai_api_key=api_key,
+    )
 
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i : i + EMBED_BATCH_SIZE]
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
-        for item in resp.data:
-            all_embeddings.append(item.embedding)
+    # Dense retriever: FAISS
+    faiss_store = FAISS.from_documents(documents, embeddings)
+    dense_retriever = faiss_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": top_k},
+    )
 
-    matrix = np.array(all_embeddings, dtype=np.float32)
-    # L2-normalise so dot product = cosine similarity
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return matrix / norms
+    # Sparse retriever: BM25 (simulates TF-IDF from real MeQA)
+    bm25_retriever = BM25Retriever.from_documents(documents, k=top_k)
+
+    # Ensemble (like MeQA combining TF-IDF + VSM/LSI)
+    ensemble = EnsembleRetriever(
+        retrievers=[bm25_retriever, dense_retriever],
+        weights=[bm25_weight, dense_weight],
+    )
+
+    return ensemble, faiss_store
 
 
-class VectorIndex:
-    """In-memory vector index with cosine-similarity search.
+def filter_by_drug_and_section(
+    results: list[Document],
+    drug_name: str,
+    predicted_sections: list[int],
+    max_results: int = 6,
+) -> list[Document]:
+    """MeQA Block 2 — Filter results by drug name and predicted sections.
 
-    Lightweight alternative to FAISS/Chroma — sufficient for the ~200-500
-    chunks that come from 20-30 drug prospectos.
+    Simulates:
+    - Leaflet selection (filter by medicine name/dose/form)
+    - Section extraction (prioritise bi-LSTM predicted sections,
+      keep VSM/LSI additional sections at lower priority)
     """
+    drug_lower = drug_name.lower()
+    drug_tokens = {t for t in drug_lower.split() if len(t) > 2}
 
-    def __init__(self, chunks: list[dict], embeddings: np.ndarray):
-        self.chunks = chunks
-        self.embeddings = embeddings  # (N, D), L2-normalised
+    # Score each result by drug match + section match
+    scored: list[tuple[float, Document]] = []
+    for doc in results:
+        doc_drug = doc.metadata.get("drug_name_lower", "")
+        doc_section = doc.metadata.get("section_number", 0)
 
-    def search(
-        self,
-        query_embedding: np.ndarray,
-        top_k: int = 5,
-        drug_filter: str | None = None,
-    ) -> list[dict]:
-        """Return top-k most similar chunks.
-
-        Args:
-            query_embedding: (D,) normalised vector.
-            top_k: Number of results.
-            drug_filter: If set, only search chunks whose drug_name_norm
-                         contains this string (pre-filter by drug).
-
-        Returns:
-            List of {chunk, score} dicts, highest score first.
-        """
-        if drug_filter:
-            drug_norm = _normalise(drug_filter)
-            mask = np.array([
-                _drug_matches(c["drug_name_norm"], drug_norm)
-                for c in self.chunks
-            ])
-            if not mask.any():
-                # Fall back to full search if no drug matches
-                mask = np.ones(len(self.chunks), dtype=bool)
+        # Drug match score
+        drug_score = 0.0
+        if drug_lower in doc_drug or doc_drug in drug_lower:
+            drug_score = 1.0
         else:
-            mask = np.ones(len(self.chunks), dtype=bool)
+            doc_tokens = {t for t in doc_drug.split() if len(t) > 2}
+            overlap = len(drug_tokens & doc_tokens)
+            if overlap >= 2:
+                drug_score = 0.7
+            elif overlap >= 1:
+                drug_score = 0.3
 
-        subset_embeddings = self.embeddings[mask]
-        subset_indices = np.where(mask)[0]
+        # Section match score (bi-LSTM predicted sections get higher priority)
+        section_score = 0.0
+        if doc_section in predicted_sections:
+            section_score = 1.0   # Main answer section (like bi-LSTM prediction)
+        elif doc_section > 0:
+            section_score = 0.4   # Additional info (like VSM/LSI sections)
 
-        if len(subset_embeddings) == 0:
-            return []
+        total = drug_score * 0.6 + section_score * 0.4
+        scored.append((total, doc))
 
-        # Cosine similarity via dot product (vectors are already normalised)
-        scores = subset_embeddings @ query_embedding
-        top_indices = np.argsort(scores)[::-1][:top_k]
-
-        results = []
-        for idx in top_indices:
-            original_idx = subset_indices[idx]
-            results.append({
-                "chunk": self.chunks[original_idx],
-                "score": float(scores[idx]),
-            })
-        return results
-
-    @property
-    def size(self) -> int:
-        return len(self.chunks)
-
-    def save(self, path: Path):
-        """Persist index to disk so it doesn't need re-embedding."""
-        with open(path, "wb") as f:
-            pickle.dump({"chunks": self.chunks, "embeddings": self.embeddings}, f)
-
-    @classmethod
-    def load(cls, path: Path) -> "VectorIndex":
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        return cls(data["chunks"], data["embeddings"])
-
-
-def build_index(
-    prospectos_dir: Path,
-    client: OpenAI,
-    chunk_size: int = 500,
-    chunk_overlap: int = 100,
-    progress_callback=None,
-) -> VectorIndex:
-    """Full ingestion pipeline: load → chunk → embed → index."""
-    documents = load_prospectos(prospectos_dir)
-    chunks = chunk_documents(documents, chunk_size, chunk_overlap)
-
-    if not chunks:
-        return VectorIndex([], np.zeros((0, EMBEDDING_DIMS), dtype=np.float32))
-
-    texts = [c["text"] for c in chunks]
-
-    if progress_callback:
-        progress_callback("embedding", 0, len(texts))
-
-    embeddings = embed_texts(texts, client)
-
-    if progress_callback:
-        progress_callback("embedding", len(texts), len(texts))
-
-    return VectorIndex(chunks, embeddings)
+    # Sort by score descending, take top results
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored[:max_results]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. QUERY PROCESSING — Classify intent and map to drug
+# BLOCK 3 — ANSWER EXTRACTION
+# (Context assembly + LLM generation with extractive focus)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _normalise(name: str) -> str:
-    """Lower-case, collapse whitespace, strip trailing dots."""
-    return re.sub(r"\s+", " ", name.strip().lower()).rstrip(".")
+def assemble_context(
+    documents: list[Document],
+    max_chars: int = 3500,
+) -> str:
+    """MeQA Block 3 — Assemble answer context from retrieved passages.
 
-
-def _drug_matches(chunk_name: str, query_drug: str) -> bool:
-    """Check if a chunk's drug name matches the query drug (fuzzy)."""
-    if query_drug in chunk_name or chunk_name in query_drug:
-        return True
-    # Token overlap: at least 2 significant tokens match
-    q_tokens = {t for t in query_drug.split() if len(t) > 2}
-    c_tokens = {t for t in chunk_name.split() if len(t) > 2}
-    return len(q_tokens & c_tokens) >= 2
-
-
-# Section-hint keywords for query-category-aware retrieval boost
-_CATEGORY_BOOST_TERMS: dict[str, str] = {
-    "indication": "indicación para qué sirve tratamiento",
-    "adverse_effects": "efectos adversos secundarios reacciones",
-    "pregnancy": "embarazo lactancia fertilidad",
-    "dosage": "dosis posología cómo tomar cantidad",
-    "driving": "conducir conducción máquinas",
-    "contraindications": "contraindicaciones no tome no debe",
-    "storage": "conservación almacenar caducidad",
-    "alcohol": "alcohol bebidas alcohólicas",
-    "food": "comida alimentos comidas",
-    "equivalence": "genérico bioequivalente mismo principio",
-    "recommendation": "mejor diferencia comparar",
-    "switching": "cambiar sustituir intercambiar",
-}
-
-
-def build_retrieval_query(query: dict) -> str:
-    """Augment the raw query text with category-specific boost terms.
-
-    This makes the embedding more likely to match the right prospecto section.
+    Simulates MeQA's answer extraction:
+    - Extract sentences from selected leaflets for predicted sections
+    - Remove duplicate sentences
+    - Add context (section headers) for understandability
+    - Group by sections
     """
-    query_text = query.get("query_text", "")
-    category = query.get("query_category", "")
-    drug_name = query.get("drug_name", "")
-
-    boost = _CATEGORY_BOOST_TERMS.get(category, "")
-    return f"{drug_name} {query_text} {boost}".strip()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5 & 6. RETRIEVAL + CONTEXT ASSEMBLY
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def retrieve_context(
-    query: dict,
-    index: VectorIndex,
-    client: OpenAI,
-    top_k: int = 5,
-    min_score: float = 0.25,
-) -> list[dict]:
-    """Retrieve the top-k relevant chunks for a query.
-
-    Steps:
-        1. Build augmented retrieval query
-        2. Embed the query
-        3. Pre-filter index by drug name
-        4. Cosine similarity search
-        5. Filter by minimum score threshold
-    """
-    retrieval_text = build_retrieval_query(query)
-    query_emb = embed_texts([retrieval_text], client)[0]
-
-    drug_name = query.get("drug_name", "")
-    results = index.search(query_emb, top_k=top_k, drug_filter=drug_name)
-
-    # Filter low-confidence results
-    return [r for r in results if r["score"] >= min_score]
-
-
-def assemble_context(results: list[dict], max_context_chars: int = 3000) -> str:
-    """Format retrieved chunks into a prompt-ready context block.
-
-    Deduplicates, orders by score, and includes source section titles.
-    """
-    if not results:
+    if not documents:
         return ""
 
-    seen_texts: set[str] = set()
+    # Deduplicate by content prefix
+    seen: set[str] = set()
+    unique_docs: list[Document] = []
+    for doc in documents:
+        key = doc.page_content[:120]
+        if key not in seen:
+            seen.add(key)
+            unique_docs.append(doc)
+
+    # Group by section and format with headers (like MeQA adds context)
     parts: list[str] = []
     total_chars = 0
 
-    for r in results:
-        text = r["chunk"]["text"]
-        # Simple dedup: skip near-identical chunks
-        text_key = text[:100]
-        if text_key in seen_texts:
-            continue
-        seen_texts.add(text_key)
+    for doc in unique_docs:
+        section_title = doc.metadata.get("section_title", "")
+        drug = doc.metadata.get("drug_name", "")
+        sec_num = doc.metadata.get("section_number", 0)
+        sec_label = LEAFLET_SECTIONS.get(sec_num, "")
 
-        section = r["chunk"].get("section_title", "")
-        drug = r["chunk"].get("drug_name", "")
-        score = r["score"]
-        header = f"[{drug} — {section}] (relevancia: {score:.2f})" if section else f"[{drug}] (relevancia: {score:.2f})"
+        # Build header with section context (MeQA adds context to sentences)
+        if sec_label:
+            header = f"[{drug} — Sección {sec_num}: {sec_label}]"
+        elif section_title:
+            header = f"[{drug} — {section_title}]"
+        else:
+            header = f"[{drug}]"
 
-        block = f"{header}\n{text}"
-        if total_chars + len(block) > max_context_chars:
-            # Add truncated final block
-            remaining = max_context_chars - total_chars
+        block = f"{header}\n{doc.page_content}"
+        if total_chars + len(block) > max_chars:
+            remaining = max_chars - total_chars
             if remaining > 100:
                 parts.append(block[:remaining] + "...")
             break
         parts.append(block)
-        total_chars += len(block) + 2  # +2 for separators
+        total_chars += len(block) + 2
 
     return "\n\n".join(parts)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 7. LLM GENERATION — MeQA persona system prompt + context + query
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── LLM Generation ──
 
 _SYSTEM_PROMPT = """\
-Eres MeQA, el asistente virtual de consulta de medicamentos de la Agencia \
-Española de Medicamentos y Productos Sanitarios (AEMPS). Tu función es \
-responder preguntas sobre medicamentos comercializados en España basándote \
-en la información oficial de los prospectos aprobados por la AEMPS.
+Eres MeQA, el sistema de consulta de medicamentos de la Agencia Española de \
+Medicamentos y Productos Sanitarios (AEMPS). Tu función es responder preguntas \
+sobre medicamentos para uso humano basándote en la información de los prospectos \
+oficiales aprobados por la AEMPS.
 
-Instrucciones estrictas:
-- Responde SIEMPRE en español.
-- Basa tu respuesta EXCLUSIVAMENTE en la información del prospecto \
-  proporcionada como contexto. No añadas información que no esté en el contexto.
-- Si el contexto no contiene información suficiente para responder, indícalo \
-  claramente y recomienda consultar el prospecto oficial completo.
-- Sé preciso, conciso y profesional en tono farmacéutico.
-- Cuando sea relevante, recomienda consultar al médico o farmacéutico.
-- Incluye información sobre indicaciones, dosis, efectos adversos, \
-  contraindicaciones o interacciones según corresponda a la pregunta.
-- NO inventes información. Si no estás seguro, dilo explícitamente.
-- Responde como si fueras el sistema MeQA oficial de la AEMPS.
+Siguiendo la arquitectura del sistema MeQA real:
+
+1. RESPONDE basándote EXCLUSIVAMENTE en los fragmentos del prospecto \
+   proporcionados como contexto. No añadas información externa.
+2. EXTRAE la información relevante del prospecto — tu respuesta debe ser \
+   lo más fiel posible al texto oficial del prospecto.
+3. Si la información del contexto no es suficiente, indica: "Esta información \
+   no se encuentra en el prospecto consultado."
+4. AÑADE contexto de sección cuando sea útil (p.ej., "Según la sección de \
+   contraindicaciones del prospecto...").
+5. Responde SIEMPRE en español, de forma precisa y profesional.
+6. Cuando sea pertinente, recomienda consultar al médico o farmacéutico.
+7. ELIMINA información duplicada en tu respuesta.
 """
 
 _USER_TEMPLATE_WITH_CONTEXT = """\
-A continuación se presentan fragmentos relevantes del prospecto oficial \
-del medicamento, recuperados de la base de datos CIMA de la AEMPS:
+Se han recuperado los siguientes fragmentos relevantes del prospecto oficial \
+del medicamento, extraídos de la base de datos CIMA de la AEMPS:
 
 {context}
 
 ---
 
-Pregunta del usuario: {query}
+Pregunta: {query}
 
-Responde basándote únicamente en la información del prospecto anterior.
+Responde basándote ÚNICAMENTE en la información del prospecto anterior. \
+Extrae y cita la información relevante de las secciones proporcionadas.
 """
 
 _USER_TEMPLATE_NO_CONTEXT = """\
-Pregunta del usuario sobre el medicamento "{drug}": {query}
+Pregunta sobre el medicamento "{drug}" ({ingredient}): {query}
 
-NOTA: No se dispone del prospecto oficial de este medicamento en la base de \
-datos. Responde con tu conocimiento farmacéutico general sobre este principio \
-activo, pero indica claramente que se debe consultar el prospecto oficial \
-aprobado por la AEMPS para información definitiva.
+NOTA: No se ha encontrado el prospecto de este medicamento en la base de datos. \
+Responde con tu conocimiento farmacéutico general pero indica claramente que \
+se debe consultar el prospecto oficial aprobado por la AEMPS.
 """
 
 
 def generate_response(
     query: dict,
     context: str,
-    client: OpenAI,
-    model: str = "gpt-4o-mini",
+    client: ChatOpenAI,
 ) -> str:
-    """Call the LLM with MeQA persona, context, and query."""
+    """MeQA Block 3 — Generate response with extractive focus."""
     query_text = query.get("query_text", "")
     drug_name = query.get("drug_name", "")
+    ingredient = query.get("principio_activo", "")
 
     if context.strip():
         user_msg = _USER_TEMPLATE_WITH_CONTEXT.format(
@@ -534,27 +501,20 @@ def generate_response(
         )
     else:
         user_msg = _USER_TEMPLATE_NO_CONTEXT.format(
-            drug=drug_name, query=query_text
+            drug=drug_name, ingredient=ingredient, query=query_text
         )
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.3,
-        max_tokens=800,
-    )
-    return resp.choices[0].message.content.strip()
+    messages = [
+        ("system", _SYSTEM_PROMPT),
+        ("human", user_msg),
+    ]
+    resp = client.invoke(messages)
+    return resp.content.strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8. RESPONSE POST-PROCESSING & BATCH ORCHESTRATION
+# PIPELINE ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════════════════
-
-INDEX_CACHE_FILE = DATA_DIR / "vector_index.pkl"
-
 
 def collect_all_responses(
     queries: list[dict],
@@ -563,17 +523,19 @@ def collect_all_responses(
     prospectos_dir: Path = PROSPECTOS_DIR,
     responses_dir: Path = RESPONSES_DIR,
     chunk_size: int = 500,
-    chunk_overlap: int = 100,
-    top_k: int = 5,
+    chunk_overlap: int = 80,
+    top_k: int = 8,
+    bm25_weight: float = 0.4,
     delay: float = 0.3,
     progress_callback=None,
     skip_existing: bool = True,
 ) -> list[dict]:
-    """Run the full MeQA RAG pipeline for all queries.
+    """Run the full MeQA-simulated RAG pipeline for all queries.
 
-    Pipeline per query:
-        Query → classify + embed → retrieve chunks → assemble context
-        → LLM generation → post-process → save JSON
+    Pipeline per query (following the 3 MeQA blocks):
+      Block 1: normalise query → extract entities → predict sections
+      Block 2: hybrid retrieve (BM25 + FAISS) → filter by drug + sections
+      Block 3: assemble context → LLM generation → save response
 
     Args:
         queries: List of query dicts from query_battery.json.
@@ -582,80 +544,94 @@ def collect_all_responses(
         prospectos_dir: Directory with prospecto JSONs.
         responses_dir: Directory to save response JSONs.
         chunk_size: Max characters per chunk.
-        chunk_overlap: Overlap characters between chunks.
-        top_k: Number of chunks to retrieve per query.
+        chunk_overlap: Overlap between chunks.
+        top_k: Chunks to retrieve per query.
+        bm25_weight: Weight for BM25 in ensemble (1-bm25_weight = dense weight).
         delay: Seconds between generation API calls.
-        progress_callback: Optional callable(current, total) for UI progress.
-        skip_existing: Skip queries that already have response files.
+        progress_callback: Optional callable(current, total).
+        skip_existing: Skip queries with existing response files.
 
     Returns:
         List of newly collected response dicts.
     """
-    client = OpenAI(api_key=api_key)
     responses_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Stage 1-3: Ingest, chunk, embed (or load cached index) ──
-    has_prospectos = any(
+    # ── Build retriever (Blocks 1-2 preparation) ──
+    has_prospectos = prospectos_dir.exists() and any(
         f.suffix == ".json" and f.name != ".gitkeep"
         for f in prospectos_dir.iterdir()
-    ) if prospectos_dir.exists() else False
+    )
 
-    index = None
+    ensemble_retriever = None
     if has_prospectos:
-        # Try loading cached index
-        if INDEX_CACHE_FILE.exists():
-            try:
-                index = VectorIndex.load(INDEX_CACHE_FILE)
-            except Exception:
-                index = None
-
-        if index is None:
-            index = build_index(
-                prospectos_dir, client,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
+        documents = load_prospecto_documents(
+            prospectos_dir, chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        )
+        if documents:
+            ensemble_retriever, _ = build_hybrid_retriever(
+                documents,
+                api_key=api_key,
+                top_k=top_k,
+                bm25_weight=bm25_weight,
+                dense_weight=1.0 - bm25_weight,
             )
-            if index.size > 0:
-                index.save(INDEX_CACHE_FILE)
 
-    # ── Stage 4-8: Process each query through the RAG pipeline ──
+    # ── LLM client ──
+    llm = ChatOpenAI(
+        model=model,
+        temperature=0.3,
+        max_tokens=800,
+        openai_api_key=api_key,
+    )
+
+    # ── Process each query through the 3 MeQA blocks ──
     collected = []
     total = len(queries)
 
     for i, query in enumerate(queries):
         qid = query.get("query_id", f"Q{i+1:04d}")
 
-        # Skip existing
         fpath = responses_dir / f"{qid}.json"
         if skip_existing and fpath.exists():
             if progress_callback:
                 progress_callback(i + 1, total)
             continue
 
-        # 4-5. Retrieve relevant context
-        context_str = ""
-        retrieval_results = []
-        if index is not None and index.size > 0:
-            retrieval_results = retrieve_context(
-                query, index, client, top_k=top_k
-            )
-            # 6. Assemble context
-            context_str = assemble_context(retrieval_results)
+        # ── BLOCK 1: Question Processing ──
+        normalised = normalise_query(query.get("query_text", ""))
+        entities = extract_entities(query)
+        predicted_secs = predict_sections(query.get("query_category", ""))
 
-        # 7. Generate response
+        # ── BLOCK 2: Leaflets & Sections Extraction ──
+        context_str = ""
+        chunks_used = 0
+        if ensemble_retriever is not None:
+            # Build retrieval query with drug name + normalised query
+            retrieval_query = (
+                f"{entities['medicine_name']} {normalised}"
+            )
+            raw_results = ensemble_retriever.invoke(retrieval_query)
+
+            # Filter by drug name and predicted sections
+            filtered = filter_by_drug_and_section(
+                raw_results,
+                drug_name=entities["medicine_name"],
+                predicted_sections=predicted_secs,
+                max_results=top_k,
+            )
+            chunks_used = len(filtered)
+
+            # ── BLOCK 3 (part 1): Context assembly ──
+            context_str = assemble_context(filtered)
+
+        # ── BLOCK 3 (part 2): Answer generation ──
         try:
-            response_text = generate_response(query, context_str, client, model)
+            response_text = generate_response(query, context_str, llm)
         except Exception as e:
             response_text = ""
             query["error"] = str(e)
 
-        # 8. Post-process and save
-        chunks_used = len(retrieval_results)
-        avg_score = (
-            sum(r["score"] for r in retrieval_results) / chunks_used
-            if chunks_used > 0 else 0.0
-        )
-
+        # ── Save response ──
         response_data = {
             "query_id": qid,
             "pair_id": query.get("pair_id", ""),
@@ -669,17 +645,24 @@ def collect_all_responses(
             "response_text": response_text,
             "response_word_count": len(response_text.split()) if response_text else 0,
             "collection_timestamp": datetime.now(timezone.utc).isoformat(),
-            "rag_metadata": {
+            "meqa_metadata": {
                 "model": model,
+                "normalised_query": normalised,
+                "entities": entities,
+                "predicted_sections": predicted_secs,
+                "predicted_section_names": [
+                    LEAFLET_SECTIONS.get(s, "") for s in predicted_secs
+                ],
                 "chunks_retrieved": chunks_used,
-                "avg_similarity_score": round(avg_score, 4),
                 "context_available": bool(context_str),
-                "embedding_model": EMBEDDING_MODEL,
-                "chunk_size": chunk_size,
+                "retrieval_method": "hybrid_bm25_faiss",
+                "bm25_weight": bm25_weight,
             },
             "notes": (
-                f"RAG-generated (model={model}, "
-                f"chunks={chunks_used}, avg_score={avg_score:.3f})"
+                f"MeQA-RAG (model={model}, "
+                f"retrieval=BM25+FAISS, "
+                f"sections={predicted_secs}, "
+                f"chunks={chunks_used})"
             ),
         }
 
