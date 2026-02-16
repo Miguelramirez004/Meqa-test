@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (large files - keep structure, ignore content)
+data/prospectos/*.json
+data/responses/*.json
+data/analysis/*.csv
+data/analysis/*.xlsx
+!data/**/.gitkeep
+
+# Playwright
+playwright-report/
+test-results/
+
+# Jupyter
+.ipynb_checkpoints/
