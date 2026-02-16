@@ -266,11 +266,11 @@ elif page == "4. Collect Responses":
     st.markdown("---")
 
     # ── Automated RAG collection ──
-    st.subheader("Automated Collection (RAG)")
+    st.subheader("Automated Collection (RAG Pipeline)")
     st.markdown(
-        "Uses downloaded prospectos as context and an OpenAI model to generate "
-        "responses that simulate the MeQA system. Requires an OpenAI API key "
-        "configured in **Streamlit secrets** (`OPENAI_API_KEY`)."
+        "Implements the full MeQA RAG architecture: "
+        "**Ingest** prospectos → **Chunk** into segments → **Embed** with OpenAI → "
+        "**Retrieve** top-k similar chunks per query → **Generate** response via LLM."
     )
 
     # Check for API key
@@ -286,22 +286,53 @@ elif page == "4. Collect Responses":
         1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
     )
 
-    model = st.selectbox(
-        "Model",
-        ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
-        index=0,
-        help="gpt-4o-mini is recommended (fast and cost-effective).",
-    )
+    # Pipeline configuration
+    col_cfg1, col_cfg2 = st.columns(2)
+    with col_cfg1:
+        model = st.selectbox(
+            "LLM Model (generation)",
+            ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
+            index=0,
+            help="gpt-4o-mini is recommended (fast and cost-effective).",
+        )
+        top_k = st.slider(
+            "Chunks to retrieve (top-k)", min_value=1, max_value=10, value=5,
+            help="Number of prospecto chunks fed as context to the LLM.",
+        )
+    with col_cfg2:
+        chunk_size = st.selectbox(
+            "Chunk size (chars)", [300, 500, 750, 1000], index=1,
+            help="Smaller chunks = more precise retrieval; larger = more context.",
+        )
+        chunk_overlap = st.selectbox(
+            "Chunk overlap (chars)", [50, 100, 150, 200], index=1,
+            help="Overlap between consecutive chunks to preserve context.",
+        )
 
     skip_existing = st.checkbox("Skip already-collected responses", value=True)
 
+    # Index status
+    from src.rag_engine import INDEX_CACHE_FILE
+    index_cached = INDEX_CACHE_FILE.exists()
+
     if prospecto_count > 0:
-        st.info(f"**{prospecto_count}** prospectos available as RAG context.")
+        status_msg = f"**{prospecto_count}** prospectos available as RAG context."
+        if index_cached:
+            status_msg += " Vector index cached (will reuse)."
+        else:
+            status_msg += " Vector index will be built on first run."
+        st.info(status_msg)
     else:
         st.warning(
             "No prospectos downloaded yet. The model will answer from general "
             "pharmaceutical knowledge. For better results, run **Step 3** first."
         )
+
+    if index_cached:
+        if st.button("Rebuild Vector Index", help="Delete cached index to force re-embedding"):
+            INDEX_CACHE_FILE.unlink()
+            st.success("Cache cleared. Index will rebuild on next collection run.")
+            st.rerun()
 
     if not api_key:
         st.info("Enter your OpenAI API key above to enable automated collection.")
@@ -321,12 +352,16 @@ elif page == "4. Collect Responses":
                 status_text.text(f"Processing query {current}/{total}...")
 
             try:
+                status_text.text("Building vector index (embedding prospectos)...")
                 collected = rag_collect(
                     queries=queries_list,
                     api_key=api_key,
                     model=model,
                     prospectos_dir=PROSPECTOS_DIR,
                     responses_dir=RESPONSES_DIR,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    top_k=top_k,
                     delay=0.3,
                     progress_callback=update_progress,
                     skip_existing=skip_existing,
