@@ -266,11 +266,14 @@ elif page == "4. Collect Responses":
     st.markdown("---")
 
     # ── Automated RAG collection ──
-    st.subheader("Automated Collection (RAG Pipeline)")
+    st.subheader("Automated Collection (MeQA RAG Pipeline)")
     st.markdown(
-        "Implements the full MeQA RAG architecture: "
-        "**Ingest** prospectos → **Chunk** into segments → **Embed** with OpenAI → "
-        "**Retrieve** top-k similar chunks per query → **Generate** response via LLM."
+        "Simulates the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
+        "(AEMPS, Santamaría 2021) using LangChain:\n\n"
+        "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
+        "**Block 2** — Hybrid Retrieval: BM25 (sparse, like TF-IDF) + FAISS (dense) "
+        "with section-aware filtering\n\n"
+        "**Block 3** — Answer Extraction: context assembly + LLM generation"
     )
 
     # Check for API key
@@ -296,7 +299,7 @@ elif page == "4. Collect Responses":
             help="gpt-4o-mini is recommended (fast and cost-effective).",
         )
         top_k = st.slider(
-            "Chunks to retrieve (top-k)", min_value=1, max_value=10, value=5,
+            "Chunks to retrieve (top-k)", min_value=1, max_value=12, value=8,
             help="Number of prospecto chunks fed as context to the LLM.",
         )
     with col_cfg2:
@@ -304,42 +307,28 @@ elif page == "4. Collect Responses":
             "Chunk size (chars)", [300, 500, 750, 1000], index=1,
             help="Smaller chunks = more precise retrieval; larger = more context.",
         )
-        chunk_overlap = st.selectbox(
-            "Chunk overlap (chars)", [50, 100, 150, 200], index=1,
-            help="Overlap between consecutive chunks to preserve context.",
+        bm25_weight = st.slider(
+            "BM25 weight (sparse vs dense)", 0.0, 1.0, 0.4, 0.1,
+            help="0.0 = dense only (FAISS), 1.0 = sparse only (BM25). "
+                 "0.4 recommended (like MeQA's TF-IDF + VSM/LSI blend).",
         )
 
     skip_existing = st.checkbox("Skip already-collected responses", value=True)
 
-    # Index status
-    from src.rag_engine import INDEX_CACHE_FILE
-    index_cached = INDEX_CACHE_FILE.exists()
-
     if prospecto_count > 0:
-        status_msg = f"**{prospecto_count}** prospectos available as RAG context."
-        if index_cached:
-            status_msg += " Vector index cached (will reuse)."
-        else:
-            status_msg += " Vector index will be built on first run."
-        st.info(status_msg)
+        st.info(f"**{prospecto_count}** prospectos available as RAG context.")
     else:
         st.warning(
             "No prospectos downloaded yet. The model will answer from general "
             "pharmaceutical knowledge. For better results, run **Step 3** first."
         )
 
-    if index_cached:
-        if st.button("Rebuild Vector Index", help="Delete cached index to force re-embedding"):
-            INDEX_CACHE_FILE.unlink()
-            st.success("Cache cleared. Index will rebuild on next collection run.")
-            st.rerun()
-
     if not api_key:
         st.info("Enter your OpenAI API key above to enable automated collection.")
     elif total_queries == 0:
         st.warning("No query battery found. Run **Step 2** first.")
     else:
-        if st.button("Run RAG Collection", type="primary"):
+        if st.button("Run MeQA RAG Collection", type="primary"):
             queries_json = QUERIES_DIR / "query_battery.json"
             with open(queries_json, encoding="utf-8") as f:
                 queries_list = json.load(f)
@@ -352,7 +341,7 @@ elif page == "4. Collect Responses":
                 status_text.text(f"Processing query {current}/{total}...")
 
             try:
-                status_text.text("Building vector index (embedding prospectos)...")
+                status_text.text("Building hybrid retriever (BM25 + FAISS)...")
                 collected = rag_collect(
                     queries=queries_list,
                     api_key=api_key,
@@ -360,8 +349,9 @@ elif page == "4. Collect Responses":
                     prospectos_dir=PROSPECTOS_DIR,
                     responses_dir=RESPONSES_DIR,
                     chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
+                    chunk_overlap=80,
                     top_k=top_k,
+                    bm25_weight=bm25_weight,
                     delay=0.3,
                     progress_callback=update_progress,
                     skip_existing=skip_existing,
