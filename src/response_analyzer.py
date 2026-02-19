@@ -23,18 +23,31 @@ PROFESSIONAL_KEYWORDS = [
     "médico", "farmacéutico", "profesional sanitario",
     "consulte", "acuda", "pregunte a su",
     "prescripción", "receta",
+    "doctor", "especialista", "profesional de la salud",
+    "atención médica", "servicio de urgencias", "centro de salud",
+    "consulta médica", "supervisión médica", "control médico",
+    "bajo prescripción", "indicación médica",
 ]
 
 BIOEQUIVALENCE_KEYWORDS = [
     "bioequivalente", "bioequivalencia", "mismo principio activo",
     "equivalente terapéutico", "mismo efecto", "misma composición",
     "genérico", "efg", "intercambiable",
+    "equivalencia", "misma eficacia", "misma seguridad",
+    "mismo medicamento", "sustancia activa", "principio activo",
+    "medicamento genérico", "especialidad genérica",
+    "biodisponibilidad", "misma calidad",
 ]
 
 SAFETY_KEYWORDS = [
     "precaución", "advertencia", "no tome", "no debe",
     "contraindicado", "riesgo", "peligro", "grave",
     "suspenda", "interrumpa", "urgencia", "inmediatamente",
+    "atención inmediata", "reacción grave", "efectos graves",
+    "sobredosis", "intoxicación", "toxicidad",
+    "evite", "no utilice", "no use", "no administre",
+    "tenga cuidado", "especial cuidado", "tenga precaución",
+    "informe a su médico", "avise a su médico",
 ]
 
 ADVERSE_EFFECTS = [
@@ -44,15 +57,42 @@ ADVERSE_EFFECTS = [
     "estreñimiento", "somnolencia", "prurito", "urticaria",
     "dolor abdominal", "flatulencia", "sequedad de boca",
     "ansiedad", "temblor", "sudoración",
+    "palpitaciones", "taquicardia", "hipotensión",
+    "edema", "hinchazón", "artralgia", "mialgia",
+    "dolor muscular", "dolor articular", "visión borrosa",
+    "alopecia", "caída del cabello", "aumento de peso",
+    "pérdida de apetito", "dispepsia", "acidez",
+    "erupción cutánea", "dermatitis", "fotosensibilidad",
+    "reacción anafiláctica", "angioedema", "broncoespasmo",
+    "hepatotoxicidad", "ictericia", "nefrotoxicidad",
+    "parestesia", "vértigo", "acúfenos", "tinnitus",
+]
+
+# Phrases that indicate the RAG framework could NOT retrieve prospecto data
+INCOMPLETE_RESPONSE_INDICATORS = [
+    "no se encuentra en el prospecto",
+    "no se ha encontrado",
+    "no dispongo de información",
+    "no tengo información",
+    "no puedo proporcionar",
+    "información no disponible",
+    "no se ha podido recuperar",
+    "no se ha podido obtener",
+    "consulte el prospecto oficial",
+    "no se encuentra disponible",
+    "no aparece en el prospecto",
+    "no consta en el prospecto",
+    "no he encontrado información",
+    "no se ha localizado",
 ]
 
 INFORMATION_CATEGORIES = {
-    "mentions_indication": r"indicad|sirve para|tratamiento de|para tratar|se utiliza",
-    "mentions_dosage": r"dosis|posología|mg|comprimido|cápsula|sobre|tomar \d",
-    "mentions_adverse_effects": r"efecto|adverso|secundario|reacción",
-    "mentions_contraindications": r"contraindicac|no tome|no debe tomar|alérgic|hipersensib",
-    "mentions_interactions": r"interacción|otros medicamentos|junto con|combinación",
-    "mentions_pregnancy": r"embaraz|lactancia|gestación|fértil|anticonceptiv",
+    "mentions_indication": r"indicad|sirve para|tratamiento de|para tratar|se utiliza|está indicado|indicaciones",
+    "mentions_dosage": r"dosis|posología|mg|comprimido|cápsula|sobre|tomar \d|administración|pauta|vía oral",
+    "mentions_adverse_effects": r"efecto|adverso|secundario|reacción|no deseado|frecuente|poco frecuente|raro",
+    "mentions_contraindications": r"contraindicac|no tome|no debe tomar|alérgic|hipersensib|no utilice|prohibido",
+    "mentions_interactions": r"interacción|otros medicamentos|junto con|combinación|concomitante|simultáneamente|asociación",
+    "mentions_pregnancy": r"embaraz|lactancia|gestación|fértil|anticonceptiv|periodo de lactancia|mujeres en edad",
 }
 
 
@@ -116,13 +156,44 @@ def analyze_response(response_text: str, query: dict) -> dict:
     return metrics
 
 
+def is_incomplete_response(response_text: str, data: dict) -> bool:
+    """Check if a response is incomplete (RAG framework could not retrieve data).
+
+    A response is considered incomplete when:
+    - The RAG context was not available (no prospecto chunks retrieved)
+    - The response text contains phrases indicating data was not found
+    - The response has zero retrieved chunks
+
+    These incomplete responses should be disregarded before analysis
+    to avoid skewing metrics with non-answers.
+    """
+    # Check meqa_metadata for missing context
+    metadata = data.get("meqa_metadata", {})
+    if metadata:
+        if not metadata.get("context_available", True):
+            return True
+        if metadata.get("chunks_retrieved", -1) == 0:
+            return True
+
+    # Check response text for indicators that no data was retrieved
+    text_lower = response_text.lower()
+    for indicator in INCOMPLETE_RESPONSE_INDICATORS:
+        if indicator in text_lower:
+            return True
+
+    return False
+
+
 def analyze_all_responses() -> list[dict]:
     """Analyze all response files in data/responses/.
 
     Looks for JSON files named Q*.json with 'response_text' field.
+    Disregards incomplete responses where the RAG framework could not
+    retrieve prospecto data, as these non-answers would skew metrics.
     Returns list of metric dicts and saves to CSV.
     """
     all_metrics = []
+    skipped_incomplete = 0
     response_files = sorted(RESPONSES_DIR.glob("Q*.json"))
 
     if not response_files:
@@ -138,8 +209,16 @@ def analyze_all_responses() -> list[dict]:
         if not response_text or "error" in data:
             continue
 
+        # Disregard responses where RAG could not retrieve data
+        if is_incomplete_response(response_text, data):
+            skipped_incomplete += 1
+            continue
+
         metrics = analyze_response(response_text, data)
         all_metrics.append(metrics)
+
+    if skipped_incomplete:
+        print(f"  Skipped {skipped_incomplete} incomplete responses (no RAG data retrieved)")
 
     if all_metrics:
         ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
