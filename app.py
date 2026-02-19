@@ -299,12 +299,12 @@ elif page == "4. Collect Responses":
             help="gpt-4o-mini is recommended (fast and cost-effective).",
         )
         top_k = st.slider(
-            "Chunks to retrieve (top-k)", min_value=1, max_value=12, value=8,
+            "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=12,
             help="Number of prospecto chunks fed as context to the LLM.",
         )
     with col_cfg2:
         chunk_size = st.selectbox(
-            "Chunk size (chars)", [300, 500, 750, 1000], index=1,
+            "Chunk size (chars)", [300, 500, 600, 750, 1000], index=2,
             help="Smaller chunks = more precise retrieval; larger = more context.",
         )
         bm25_weight = st.slider(
@@ -440,16 +440,48 @@ elif page == "4. Collect Responses":
     if resp_count > 0:
         st.markdown("---")
         st.subheader("Existing Responses")
-        resp_files = sorted(RESPONSES_DIR.glob("Q*.json"))[:20]
-        rows = []
-        for rf in resp_files:
+
+        # ── Download All Responses ──
+        all_resp_files = sorted(RESPONSES_DIR.glob("Q*.json"))
+        all_resp_data = []
+        for rf in all_resp_files:
             with open(rf, encoding="utf-8") as f:
-                d = json.load(f)
-            text = d.get("response_text", "")
+                all_resp_data.append(json.load(f))
+
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            resp_df_export = pd.json_normalize(all_resp_data, sep="_")
+            csv_bytes = resp_df_export.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download All Responses (CSV)",
+                csv_bytes,
+                "meqa_responses.csv",
+                "text/csv",
+                key="dl_resp_csv",
+            )
+        with col_dl2:
+            json_bytes = json.dumps(
+                all_resp_data, ensure_ascii=False, indent=2
+            ).encode("utf-8")
+            st.download_button(
+                "Download All Responses (JSON)",
+                json_bytes,
+                "meqa_responses.json",
+                "application/json",
+                key="dl_resp_json",
+            )
+
+        st.markdown("---")
+
+        # Preview table
+        resp_files = all_resp_files[:20]
+        rows = []
+        for rf_data in all_resp_data[:20]:
+            text = rf_data.get("response_text", "")
             rows.append({
-                "Query ID": d.get("query_id", rf.stem),
-                "Drug": d.get("drug_name", ""),
-                "Category": d.get("query_category", ""),
+                "Query ID": rf_data.get("query_id", ""),
+                "Drug": rf_data.get("drug_name", ""),
+                "Category": rf_data.get("query_category", ""),
                 "Words": len(text.split()) if text else 0,
                 "Preview": text[:100] + "..." if len(text) > 100 else text,
             })
