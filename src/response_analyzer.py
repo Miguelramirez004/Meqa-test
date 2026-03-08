@@ -1,14 +1,18 @@
 """Layer 1: Drug Mention Audit — Response analysis.
 
-Codes each response into mention-based metrics:
-- Which drug names appear (brand, generic, both, neither)
-- Position of first mention (word index)
-- Mention frequency (count)
-- Information density around each mention (sentences)
-- Cross-reference detection (does querying one drug pull in the paired drug?)
+Codes each response into mention-based metrics with broad drug name
+recognition:
+
+1. **INN detection** — Identifies the active ingredient (principio activo)
+   mentioned by its International Non-proprietary Name (e.g., "omeprazol").
+2. **Brand detection** — Recognises all known commercial brand names for
+   the active ingredient in the Spanish market and internationally
+   (e.g., "Losec", "Mepral", "Prilosec").
+3. **Generic-product detection** — Detects specific generic products by
+   INN + laboratory name (e.g., "Omeprazol Cinfa", "Omeprazol Normon").
 
 After collection, computes asymmetry scores per drug pair:
-- MENTION_ASYMMETRY: normalized mention count difference
+- MENTION_ASYMMETRY: normalized brand vs generic mention count difference
 - POSITION_ASYMMETRY: which drug appears earlier
 - CROSS_REF_RATIO: directional cross-reference probability
 - COMPOSITE_ASYMMETRY_SCORE: mean of normalized scores
@@ -20,6 +24,37 @@ import json
 import csv
 from pathlib import Path
 from .config import RESPONSES_DIR, ANALYSIS_DIR
+
+
+# ── Brand name knowledge base ─────────────────────────────────────────────
+# All known commercial (brand) names per INN in the Spanish and
+# international markets.  Keys are lowercase INN.
+
+BRAND_NAMES_BY_INN = {
+    "omeprazol": ["losec", "mepral", "prilosec", "omeprol", "pepticum",
+                   "ulceral", "parizac", "gastrimut"],
+    "atorvastatina": ["cardyl", "lipitor", "prevencor", "zarator", "sortis",
+                       "torvast", "totalip"],
+    "escitalopram": ["cipralex", "esertia", "lexapro"],
+    "amoxicilina": ["clamoxyl", "amoxil", "augmentine"],
+    "ibuprofeno": ["neobrufen", "espidifen", "dalsy", "advil", "motrin",
+                    "ibufen", "algidol"],
+    "metformina": ["dianben", "glucophage", "metformina teva"],
+    "sertralina": ["besitran", "aremis", "zoloft"],
+    "simvastatina": ["zocor", "pantok", "simvastatina"],
+    "amlodipino": ["norvasc", "astudal"],
+    "levotiroxina": ["eutirox", "levothroid", "synthroid", "euthyrox"],
+}
+
+# Common generic pharmaceutical laboratory names in Spain
+GENERIC_LABS = [
+    "cinfa", "normon", "kern pharma", "teva", "stada", "mylan",
+    "sandoz", "ratiopharm", "pensa", "alter", "vir", "aurovitas",
+    "zentiva", "aristo", "bluefish", "accord", "sanofi", "ranbaxy",
+    "actavis", "apotex", "biogaran", "davur", "edigen", "farmalider",
+    "gedeon richter", "korhispana", "ratio", "sun pharma", "tecnigen",
+    "winthrop",
+]
 
 
 # ── Keyword dictionaries (kept for supplementary analysis) ────────────────
@@ -118,6 +153,91 @@ def _extract_short_name(full_name: str) -> str:
     return " ".join(short).lower() if short else full_name.lower()
 
 
+def _extract_inn(principio_activo: str) -> str:
+    """Extract the INN (International Non-proprietary Name) from principio_activo.
+
+    'Omeprazol 20mg' → 'omeprazol'
+    'Atorvastatina 20mg' → 'atorvastatina'
+    """
+    if not principio_activo:
+        return ""
+    words = principio_activo.strip().split()
+    inn_words = []
+    for w in words:
+        if re.match(r"^\d", w) or w.upper() in ("MG", "MCG", "ML"):
+            break
+        inn_words.append(w)
+    return " ".join(inn_words).lower()
+
+
+def _get_brand_names(inn: str, pair_brand: str = "") -> list[str]:
+    """Get all known brand names for a given INN.
+
+    Combines the knowledge base with the specific pair brand name.
+    Returns lowercase list of brand names (shortest first for matching).
+    """
+    brands = set()
+
+    # Add from knowledge base
+    for known_inn, known_brands in BRAND_NAMES_BY_INN.items():
+        if known_inn == inn or inn.startswith(known_inn):
+            brands.update(known_brands)
+
+    # Add the pair's specific brand short name
+    if pair_brand:
+        short = _extract_short_name(pair_brand)
+        if short:
+            brands.add(short)
+            # Also add just the first word if multi-word
+            first = short.split()[0]
+            if first and len(first) >= 3:
+                brands.add(first)
+
+    # Remove the INN itself from brand names (it's generic)
+    brands.discard(inn)
+
+    return sorted(brands, key=len)
+
+
+def _find_word_positions(text: str, pattern: str) -> list[int]:
+    """Find all word-level positions where pattern appears in text.
+
+    Uses word-boundary aware matching. Returns 0-indexed word positions.
+    """
+    if not pattern or len(pattern) < 3:
+        return []
+
+    text_lower = text.lower()
+    pattern_lower = pattern.lower()
+    positions = []
+
+    # Use regex for word-boundary matching where possible
+    escaped = re.escape(pattern_lower)
+    try:
+        for m in re.finditer(escaped, text_lower):
+            idx = m.start()
+            word_pos = len(text_lower[:idx].split()) - 1
+            if word_pos < 0:
+                word_pos = 0
+            if word_pos not in positions:
+                positions.append(word_pos)
+    except re.error:
+        # Fallback to simple find
+        start = 0
+        while True:
+            idx = text_lower.find(pattern_lower, start)
+            if idx == -1:
+                break
+            word_pos = len(text_lower[:idx].split()) - 1
+            if word_pos < 0:
+                word_pos = 0
+            if word_pos not in positions:
+                positions.append(word_pos)
+            start = idx + len(pattern_lower)
+
+    return sorted(positions)
+
+
 def _find_mentions(text: str, drug_name: str) -> list[int]:
     """Find all word positions where drug_name appears in text.
 
@@ -151,6 +271,57 @@ def _find_mentions(text: str, drug_name: str) -> list[int]:
     return positions
 
 
+def _find_all_brand_mentions(text: str, inn: str, pair_brand: str = "") -> tuple[list[int], list[str]]:
+    """Find all brand name mentions in text for a given INN.
+
+    Returns (positions, brand_names_found).
+    """
+    brand_names = _get_brand_names(inn, pair_brand)
+    all_positions = []
+    found_names = []
+
+    for brand in brand_names:
+        positions = _find_word_positions(text, brand)
+        if positions:
+            all_positions.extend(positions)
+            if brand not in found_names:
+                found_names.append(brand)
+
+    all_positions = sorted(set(all_positions))
+    return all_positions, found_names
+
+
+def _find_inn_mentions(text: str, inn: str) -> list[int]:
+    """Find all mentions of the INN (active ingredient) in text."""
+    if not inn or len(inn) < 3:
+        return []
+    return _find_word_positions(text, inn)
+
+
+def _find_generic_product_mentions(text: str, inn: str) -> tuple[list[int], list[str]]:
+    """Find mentions of specific generic products (INN + lab name).
+
+    Detects patterns like 'omeprazol cinfa', 'atorvastatina teva', etc.
+    Returns (positions, lab_names_found).
+    """
+    text_lower = text.lower()
+    all_positions = []
+    found_labs = []
+
+    for lab in GENERIC_LABS:
+        pattern = f"{inn} {lab}"
+        if len(pattern) < 5:
+            continue
+        positions = _find_word_positions(text, pattern)
+        if positions:
+            all_positions.extend(positions)
+            if lab not in found_labs:
+                found_labs.append(lab)
+
+    all_positions = sorted(set(all_positions))
+    return all_positions, found_labs
+
+
 def _sentences_containing(text: str, drug_name: str) -> list[str]:
     """Return sentences from text that mention the drug."""
     short = _extract_short_name(drug_name)
@@ -166,14 +337,32 @@ def _sentences_containing(text: str, drug_name: str) -> list[str]:
     return result
 
 
+def _sentences_containing_any(text: str, patterns: list[str]) -> list[str]:
+    """Return sentences containing any of the given patterns."""
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    result = []
+    for s in sentences:
+        s_lower = s.lower()
+        if any(p in s_lower for p in patterns if p and len(p) >= 3):
+            if s not in result:
+                result.append(s)
+    return result
+
+
 # ── Core analysis ────────────────────────────────────────────────────────
 
 def analyze_response(response_text: str, query: dict) -> dict:
     """Analyze a single response for drug mention metrics.
 
+    Uses broad drug name recognition:
+    - INN (active ingredient): e.g., "omeprazol"
+    - Brand names: all known commercial names (e.g., "Losec", "Mepral")
+    - Generic products: INN + lab name (e.g., "Omeprazol Cinfa")
+
     Args:
         response_text: Full model response text.
-        query: Dict with query metadata including brand_name, generic_names.
+        query: Dict with query metadata including brand_name, generic_names,
+               principio_activo.
 
     Returns:
         Dict of coded metrics for this response.
@@ -189,22 +378,41 @@ def analyze_response(response_text: str, query: dict) -> dict:
     else:
         generic_names = generic_names_raw or []
 
-    # ── Drug mention detection ──
-    brand_positions = _find_mentions(response_text, brand_name) if brand_name else []
+    principio_activo = query.get("principio_activo", "")
+    inn = _extract_inn(principio_activo)
+
+    # ── 1. INN (active ingredient) detection ──
+    inn_positions = _find_inn_mentions(response_text, inn)
+    inn_mentioned = len(inn_positions) > 0
+    inn_mention_count = len(inn_positions)
+    inn_first_position = inn_positions[0] if inn_positions else None
+
+    # ── 2. Brand name detection (broad: all known brands for this INN) ──
+    brand_positions, brand_names_found = _find_all_brand_mentions(
+        response_text, inn, pair_brand=brand_name
+    )
     brand_mentioned = len(brand_positions) > 0
     brand_mention_count = len(brand_positions)
     brand_first_position = brand_positions[0] if brand_positions else None
 
-    generic_positions = []
-    for gn in generic_names:
-        generic_positions.extend(_find_mentions(response_text, gn))
-    generic_positions = sorted(set(generic_positions))
-    generic_mentioned = len(generic_positions) > 0
-    generic_mention_count = len(generic_positions)
-    generic_first_position = generic_positions[0] if generic_positions else None
+    # ── 3. Generic product detection (INN + lab name) ──
+    generic_product_positions, generic_labs_found = _find_generic_product_mentions(
+        response_text, inn
+    )
+    generic_product_mentioned = len(generic_product_positions) > 0
+    generic_product_mention_count = len(generic_product_positions)
 
+    # ── Combined generic = INN OR specific generic product ──
+    # Any mention of the active ingredient (INN) or a specific generic product
+    # counts as a "generic" mention for asymmetry calculation.
+    generic_all_positions = sorted(set(inn_positions + generic_product_positions))
+    generic_mentioned = len(generic_all_positions) > 0
+    generic_mention_count = len(generic_all_positions)
+    generic_first_position = generic_all_positions[0] if generic_all_positions else None
+
+    # ── First drug type mentioned ──
     if brand_first_position is not None and generic_first_position is not None:
-        first_drug_mentioned = "brand" if brand_first_position <= generic_first_position else "generic"
+        first_drug_mentioned = "brand" if brand_first_position < generic_first_position else "generic"
     elif brand_first_position is not None:
         first_drug_mentioned = "brand"
     elif generic_first_position is not None:
@@ -212,18 +420,13 @@ def analyze_response(response_text: str, query: dict) -> dict:
     else:
         first_drug_mentioned = "neither"
 
-    # ── Sentences containing each drug ──
-    brand_info_sentences = _sentences_containing(response_text, brand_name) if brand_name else []
-    generic_info_sentences = []
-    for gn in generic_names:
-        generic_info_sentences.extend(_sentences_containing(response_text, gn))
-    seen = set()
-    unique_generic_sentences = []
-    for s in generic_info_sentences:
-        if s not in seen:
-            seen.add(s)
-            unique_generic_sentences.append(s)
-    generic_info_sentences = unique_generic_sentences
+    # ── Sentences containing each drug type ──
+    brand_patterns = brand_names_found if brand_names_found else []
+    brand_info_sentences = _sentences_containing_any(response_text, brand_patterns)
+
+    generic_patterns = [inn] if inn else []
+    generic_patterns.extend(f"{inn} {lab}" for lab in generic_labs_found)
+    generic_info_sentences = _sentences_containing_any(response_text, generic_patterns)
 
     # ── Supplementary keyword metrics ──
     mentions_professional = any(kw in text_lower for kw in PROFESSIONAL_KEYWORDS)
@@ -236,17 +439,33 @@ def analyze_response(response_text: str, query: dict) -> dict:
         "pair_id": query.get("pair_id", ""),
         "drug_name": query.get("drug_name", ""),
         "brand_name": brand_name,
+        "principio_activo": principio_activo,
         "is_generic": query.get("is_generic", ""),
         "query_type": query.get("query_type", ""),
         "query_category": query.get("query_category", ""),
 
-        # Core mention data
+        # INN (active ingredient) mentions
+        "inn_mentioned": inn_mentioned,
+        "inn_mention_count": inn_mention_count,
+        "inn_first_position": inn_first_position,
+
+        # Brand mentions (all known brand names for this INN)
         "brand_mentioned": brand_mentioned,
-        "generic_mentioned": generic_mentioned,
         "brand_mention_count": brand_mention_count,
-        "generic_mention_count": generic_mention_count,
         "brand_first_position": brand_first_position,
+        "brand_names_found": "; ".join(brand_names_found),
+
+        # Generic product mentions (INN + lab)
+        "generic_product_mentioned": generic_product_mentioned,
+        "generic_product_mention_count": generic_product_mention_count,
+        "generic_labs_found": "; ".join(generic_labs_found),
+
+        # Combined generic (INN + generic products) for asymmetry
+        "generic_mentioned": generic_mentioned,
+        "generic_mention_count": generic_mention_count,
         "generic_first_position": generic_first_position,
+
+        # First-mention advantage
         "first_drug_mentioned": first_drug_mentioned,
 
         # Content around mentions

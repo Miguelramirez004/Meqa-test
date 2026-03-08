@@ -597,9 +597,11 @@ elif page == "4. Collect Responses":
 elif page == "5. Analyze Responses":
     st.header("Analyze Responses (Drug Mention Audit)")
     st.markdown(
-        "Codes each response into mention-based metrics: "
-        "brand/generic mention counts, first-mention position, "
-        "cross-reference detection, and computes asymmetry scores per pair."
+        "Codes each response with **broad drug name recognition**:\n\n"
+        "- **INN detection**: active ingredient mentions (e.g., *omeprazol*)\n"
+        "- **Brand detection**: all known commercial names (e.g., *Losec*, *Mepral*, *Prilosec*)\n"
+        "- **Generic product detection**: INN + laboratory (e.g., *Omeprazol Cinfa*)\n\n"
+        "Computes mention-based asymmetry scores per drug pair."
     )
 
     resp_count = load_responses_count()
@@ -643,15 +645,52 @@ elif page == "5. Analyze Responses":
         col3.metric("Block C: Comparative", len(comp))
 
         st.markdown("#### Drug Mention Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Brand Mentioned",
+        col1, col2, col3 = st.columns(3)
+        inn_col = "inn_mentioned" if "inn_mentioned" in metrics_df.columns else None
+        if inn_col:
+            col1.metric("INN (Active Ingredient)",
+                         f"{metrics_df['inn_mentioned'].sum()}/{len(metrics_df)}")
+        col2.metric("Brand Name Detected",
                      f"{metrics_df['brand_mentioned'].sum()}/{len(metrics_df)}")
-        col2.metric("Generic Mentioned",
+        col3.metric("Generic (INN+Product)",
                      f"{metrics_df['generic_mentioned'].sum()}/{len(metrics_df)}")
+
+        col1, col2, col3, col4 = st.columns(4)
         total_brand = metrics_df["brand_mention_count"].sum()
         total_generic = metrics_df["generic_mention_count"].sum()
-        col3.metric("Total Brand Mentions", int(total_brand))
-        col4.metric("Total Generic Mentions", int(total_generic))
+        col1.metric("Total Brand Mentions", int(total_brand))
+        col2.metric("Total Generic Mentions", int(total_generic))
+        if "inn_mention_count" in metrics_df.columns:
+            col3.metric("Total INN Mentions", int(metrics_df["inn_mention_count"].sum()))
+        if "generic_product_mention_count" in metrics_df.columns:
+            col4.metric("Generic Products (INN+Lab)",
+                         int(metrics_df["generic_product_mention_count"].sum()))
+
+        # Brand names found breakdown
+        if "brand_names_found" in metrics_df.columns:
+            st.markdown("#### Brand Names Detected")
+            brand_found = metrics_df["brand_names_found"].dropna()
+            brand_found = brand_found[brand_found != ""]
+            if not brand_found.empty:
+                all_brands = []
+                for entry in brand_found:
+                    all_brands.extend(b.strip() for b in entry.split(";") if b.strip())
+                if all_brands:
+                    brand_counts = pd.Series(all_brands).value_counts()
+                    st.bar_chart(brand_counts)
+
+        # Generic labs found breakdown
+        if "generic_labs_found" in metrics_df.columns:
+            st.markdown("#### Generic Laboratories Detected")
+            labs_found = metrics_df["generic_labs_found"].dropna()
+            labs_found = labs_found[labs_found != ""]
+            if not labs_found.empty:
+                all_labs = []
+                for entry in labs_found:
+                    all_labs.extend(l.strip() for l in entry.split(";") if l.strip())
+                if all_labs:
+                    lab_counts = pd.Series(all_labs).value_counts()
+                    st.bar_chart(lab_counts)
 
         st.markdown("#### First-Mentioned Advantage")
         brand_first = (metrics_df["first_drug_mentioned"] == "brand").sum()
@@ -664,13 +703,16 @@ elif page == "5. Analyze Responses":
 
         # Mention counts by query type
         st.markdown("#### Mentions by Query Type")
-        mention_by_type = metrics_df.groupby("query_type").agg(
-            n=("query_id", "count"),
-            brand_mentions=("brand_mention_count", "sum"),
-            generic_mentions=("generic_mention_count", "sum"),
-            brand_pct=("brand_mentioned", "mean"),
-            generic_pct=("generic_mentioned", "mean"),
-        ).reset_index()
+        agg_dict = {
+            "n": ("query_id", "count"),
+            "brand_mentions": ("brand_mention_count", "sum"),
+            "generic_mentions": ("generic_mention_count", "sum"),
+            "brand_pct": ("brand_mentioned", "mean"),
+            "generic_pct": ("generic_mentioned", "mean"),
+        }
+        if "inn_mention_count" in metrics_df.columns:
+            agg_dict["inn_mentions"] = ("inn_mention_count", "sum")
+        mention_by_type = metrics_df.groupby("query_type").agg(**agg_dict).reset_index()
         mention_by_type["brand_pct"] = (mention_by_type["brand_pct"] * 100).round(0).astype(int).astype(str) + "%"
         mention_by_type["generic_pct"] = (mention_by_type["generic_pct"] * 100).round(0).astype(int).astype(str) + "%"
         st.dataframe(mention_by_type, use_container_width=True, hide_index=True)

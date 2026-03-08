@@ -22,9 +22,15 @@ from src.response_analyzer import (
     is_incomplete_response,
     compute_asymmetry_scores,
     _extract_short_name,
+    _extract_inn,
     _find_mentions,
+    _find_all_brand_mentions,
+    _find_inn_mentions,
+    _find_generic_product_mentions,
     _sentences_containing,
     INCOMPLETE_RESPONSE_INDICATORS,
+    BRAND_NAMES_BY_INN,
+    GENERIC_LABS,
 )
 
 
@@ -45,6 +51,7 @@ def sample_query():
     return {
         "query_id": "Q0001",
         "pair_id": "P01_OMEPRAZOL",
+        "principio_activo": "Omeprazol 20mg",
         "brand_name": "LOSEC 20 MG CAPSULAS DURAS GASTRORRESISTENTES",
         "generic_names": [
             "OMEPRAZOL CINFA 20 MG CAPSULAS DURAS GASTRORRESISTENTES EFG",
@@ -147,7 +154,160 @@ class TestDrugNameExtraction:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 3. Mention Detection
+# 2b. INN Extraction
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestINNExtraction:
+
+    @pytest.mark.parametrize("pa,expected", [
+        ("Omeprazol 20mg", "omeprazol"),
+        ("Atorvastatina 20mg", "atorvastatina"),
+        ("Levotiroxina 100mcg", "levotiroxina"),
+        ("Ibuprofeno 600mg", "ibuprofeno"),
+        ("", ""),
+    ])
+    def test_extract_inn(self, pa, expected):
+        assert _extract_inn(pa) == expected
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 2c. Brand Knowledge Base
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestBrandKnowledgeBase:
+
+    def test_all_inns_have_brands(self):
+        """Every INN in the knowledge base must have at least one brand."""
+        for inn, brands in BRAND_NAMES_BY_INN.items():
+            assert len(brands) > 0, f"No brands for {inn}"
+
+    def test_known_brand_for_omeprazol(self):
+        brands = BRAND_NAMES_BY_INN["omeprazol"]
+        assert "losec" in brands
+        assert "mepral" in brands
+        assert "prilosec" in brands
+
+    def test_known_brand_for_atorvastatina(self):
+        brands = BRAND_NAMES_BY_INN["atorvastatina"]
+        assert "cardyl" in brands
+        assert "lipitor" in brands
+
+    def test_generic_labs_nonempty(self):
+        assert len(GENERIC_LABS) > 10
+
+    def test_generic_labs_contains_spanish_labs(self):
+        assert "cinfa" in GENERIC_LABS
+        assert "normon" in GENERIC_LABS
+        assert "kern pharma" in GENERIC_LABS
+        assert "teva" in GENERIC_LABS
+        assert "stada" in GENERIC_LABS
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 2d. Broad Brand Detection
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestBroadBrandDetection:
+
+    def test_detects_primary_brand(self):
+        text = "Losec es un inhibidor de bomba de protones."
+        positions, found = _find_all_brand_mentions(text, "omeprazol", "LOSEC 20 MG")
+        assert len(positions) > 0
+        assert "losec" in found
+
+    def test_detects_alternative_brand(self):
+        text = "Mepral también contiene omeprazol como principio activo."
+        positions, found = _find_all_brand_mentions(text, "omeprazol")
+        assert len(positions) > 0
+        assert "mepral" in found
+
+    def test_detects_international_brand(self):
+        text = "Prilosec es la marca comercial en Estados Unidos."
+        positions, found = _find_all_brand_mentions(text, "omeprazol")
+        assert len(positions) > 0
+        assert "prilosec" in found
+
+    def test_detects_multiple_brands(self):
+        text = "Losec y Mepral son marcas comerciales de omeprazol."
+        positions, found = _find_all_brand_mentions(text, "omeprazol")
+        assert "losec" in found
+        assert "mepral" in found
+
+    def test_no_brand_returns_empty(self):
+        text = "El omeprazol es un medicamento genérico."
+        positions, found = _find_all_brand_mentions(text, "omeprazol")
+        assert len(positions) == 0
+        assert len(found) == 0
+
+    def test_lipitor_detected_for_atorvastatina(self):
+        text = "Lipitor es una de las estatinas más vendidas."
+        positions, found = _find_all_brand_mentions(text, "atorvastatina")
+        assert "lipitor" in found
+
+    def test_zoloft_detected_for_sertralina(self):
+        text = "Zoloft se usa para tratar la depresión."
+        positions, found = _find_all_brand_mentions(text, "sertralina")
+        assert "zoloft" in found
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 2e. INN Mention Detection
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestINNMentionDetection:
+
+    def test_finds_inn(self):
+        text = "El omeprazol reduce la producción de ácido gástrico."
+        positions = _find_inn_mentions(text, "omeprazol")
+        assert len(positions) > 0
+
+    def test_finds_inn_multiple(self):
+        text = "El omeprazol es un IBP. Omeprazol se toma una vez al día."
+        positions = _find_inn_mentions(text, "omeprazol")
+        assert len(positions) >= 2
+
+    def test_no_inn_returns_empty(self):
+        text = "Este medicamento se usa para tratar la acidez."
+        positions = _find_inn_mentions(text, "omeprazol")
+        assert len(positions) == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 2f. Generic Product Detection (INN + Lab)
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestGenericProductDetection:
+
+    def test_detects_cinfa_product(self):
+        text = "Omeprazol Cinfa es un genérico bioequivalente."
+        positions, labs = _find_generic_product_mentions(text, "omeprazol")
+        assert len(positions) > 0
+        assert "cinfa" in labs
+
+    def test_detects_normon_product(self):
+        text = "Omeprazol Normon también está disponible en farmacias."
+        positions, labs = _find_generic_product_mentions(text, "omeprazol")
+        assert "normon" in labs
+
+    def test_detects_teva_product(self):
+        text = "Atorvastatina Teva es una alternativa genérica."
+        positions, labs = _find_generic_product_mentions(text, "atorvastatina")
+        assert "teva" in labs
+
+    def test_no_lab_name_returns_empty(self):
+        text = "El omeprazol es un principio activo muy utilizado."
+        positions, labs = _find_generic_product_mentions(text, "omeprazol")
+        assert len(labs) == 0
+
+    def test_detects_multiple_labs(self):
+        text = "Ibuprofeno Cinfa e ibuprofeno Kern Pharma son genéricos."
+        positions, labs = _find_generic_product_mentions(text, "ibuprofeno")
+        assert "cinfa" in labs
+        assert "kern pharma" in labs
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 3. Mention Detection (legacy)
 # ═════════════════════════════════════════════════════════════════════════
 
 class TestMentionDetection:
@@ -196,20 +356,43 @@ class TestResponseAnalysis:
         assert metrics["brand_mentioned"] is True
         assert metrics["brand_mention_count"] >= 1
 
-    def test_analyze_detects_generic(self, sample_query):
-        text = "Omeprazol Cinfa es un genérico equivalente a Losec."
+    def test_analyze_detects_inn(self, sample_query):
+        text = "El omeprazol es un inhibidor de la bomba de protones."
         metrics = analyze_response(text, sample_query)
-        assert metrics["generic_mentioned"] is True
+        assert metrics["inn_mentioned"] is True
+        assert metrics["inn_mention_count"] >= 1
+        assert metrics["generic_mentioned"] is True  # INN counts as generic
 
-    def test_analyze_detects_first_mentioned(self, sample_query):
-        text = "Losec es un IBP. Omeprazol Cinfa es su genérico."
+    def test_analyze_detects_alternative_brand(self, sample_query):
+        """Should detect Mepral as a brand for omeprazol, not just Losec."""
+        text = "Mepral es otra marca comercial de omeprazol."
+        metrics = analyze_response(text, sample_query)
+        assert metrics["brand_mentioned"] is True
+        assert "mepral" in metrics["brand_names_found"]
+
+    def test_analyze_detects_generic_product(self, sample_query):
+        text = "Omeprazol Cinfa es un genérico bioequivalente."
+        metrics = analyze_response(text, sample_query)
+        assert metrics["generic_product_mentioned"] is True
+        assert "cinfa" in metrics["generic_labs_found"]
+
+    def test_analyze_detects_first_mentioned_brand(self, sample_query):
+        text = "Losec es un IBP. El omeprazol es su principio activo."
         metrics = analyze_response(text, sample_query)
         assert metrics["first_drug_mentioned"] == "brand"
+
+    def test_analyze_detects_first_mentioned_generic(self, sample_query):
+        text = "El omeprazol es un IBP. Losec es una marca de omeprazol."
+        metrics = analyze_response(text, sample_query)
+        assert metrics["first_drug_mentioned"] == "generic"
 
     def test_analyze_neither_mentioned(self, sample_query):
         text = "Los inhibidores de la bomba de protones reducen el ácido."
         metrics = analyze_response(text, sample_query)
         assert metrics["first_drug_mentioned"] == "neither"
+        assert metrics["brand_mentioned"] is False
+        assert metrics["generic_mentioned"] is False
+        assert metrics["inn_mentioned"] is False
 
     def test_analyze_has_required_fields(self, sample_query):
         text = "Losec contiene omeprazol."
@@ -219,6 +402,11 @@ class TestResponseAnalysis:
             "brand_mention_count", "generic_mention_count",
             "brand_first_position", "generic_first_position",
             "first_drug_mentioned", "response_word_count",
+            # New broad detection fields
+            "inn_mentioned", "inn_mention_count", "inn_first_position",
+            "brand_names_found", "generic_product_mentioned",
+            "generic_product_mention_count", "generic_labs_found",
+            "principio_activo",
         }
         for field in required:
             assert field in metrics, f"Missing field: {field}"
@@ -228,22 +416,52 @@ class TestResponseAnalysis:
         metrics = analyze_response(text, sample_query)
         assert metrics["response_word_count"] == 5
 
-    def test_generic_names_from_string(self):
-        """generic_names as semicolon-separated string (from CSV)."""
+    def test_only_inn_mentioned_counts_as_generic(self, sample_query):
+        """When only the INN is mentioned (no brand, no specific generic product),
+        it should still count as generic_mentioned=True."""
+        text = "El omeprazol es un fármaco ampliamente utilizado en gastroenterología."
+        metrics = analyze_response(text, sample_query)
+        assert metrics["inn_mentioned"] is True
+        assert metrics["generic_mentioned"] is True
+        assert metrics["brand_mentioned"] is False
+        assert metrics["first_drug_mentioned"] == "generic"
+
+    def test_brand_and_inn_both_detected(self, sample_query):
+        """Both brand and INN in same response."""
+        text = "Losec contiene omeprazol como principio activo."
+        metrics = analyze_response(text, sample_query)
+        assert metrics["brand_mentioned"] is True
+        assert metrics["inn_mentioned"] is True
+        assert metrics["generic_mentioned"] is True
+
+    def test_multiple_brands_detected(self, sample_query):
+        """Multiple brand names for same INN detected."""
+        text = "Losec y Mepral son marcas comerciales de omeprazol."
+        metrics = analyze_response(text, sample_query)
+        assert metrics["brand_mentioned"] is True
+        assert "losec" in metrics["brand_names_found"]
+        assert "mepral" in metrics["brand_names_found"]
+
+    def test_atorvastatina_broad_detection(self):
+        """Test broad detection for a different INN."""
         query = {
-            "query_id": "Q0001",
-            "pair_id": "P01",
-            "brand_name": "LOSEC 20 MG",
-            "generic_names": "OMEPRAZOL CINFA 20 MG; OMEPRAZOL NORMON 20 MG",
-            "drug_name": "LOSEC 20 MG",
+            "query_id": "Q0010",
+            "pair_id": "P02_ATORVAST",
+            "principio_activo": "Atorvastatina 20mg",
+            "brand_name": "CARDYL 20 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
+            "generic_names": ["ATORVASTATINA CINFA 20 MG COMPRIMIDOS EFG"],
+            "drug_name": "CARDYL 20 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
             "is_generic": False,
             "query_type": "single",
             "query_category": "what_is",
         }
-        text = "Losec y Omeprazol Cinfa son equivalentes."
+        text = "Lipitor (atorvastatina) es una de las estatinas más vendidas. Atorvastatina Teva es una alternativa genérica."
         metrics = analyze_response(text, query)
         assert metrics["brand_mentioned"] is True
-        assert metrics["generic_mentioned"] is True
+        assert "lipitor" in metrics["brand_names_found"]
+        assert metrics["inn_mentioned"] is True
+        assert metrics["generic_product_mentioned"] is True
+        assert "teva" in metrics["generic_labs_found"]
 
 
 # ═════════════════════════════════════════════════════════════════════════
