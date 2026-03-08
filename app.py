@@ -20,9 +20,13 @@ from src.config import (
 )
 from src.drug_pairs import get_offline_pairs, OFFLINE_PAIRS
 from src.query_generator import generate_queries, save_queries
-from src.response_analyzer import analyze_response, analyze_all_responses
+from src.response_analyzer import analyze_response, analyze_all_responses, compute_asymmetry_scores
 from src.cima_client import CIMAClient
 from src.rag_engine import collect_all_responses as rag_collect
+from src.commercial_collector import (
+    collect_commercial_responses, detect_provider,
+    PROVIDER_MODELS, get_all_models,
+)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -127,8 +131,10 @@ if page == "1. Drug Pairs":
 elif page == "2. Generate Queries":
     st.header("Generate Query Battery")
     st.markdown(
-        "Creates standardized queries for each drug: "
-        "9 factual/interaction types + 3 comparative types per pair."
+        "Creates Layer 1 Drug Mention Audit queries in three blocks:\n\n"
+        "**Block A** — Condition-first (no drug name, tests corpus density)\n\n"
+        "**Block B** — Single-drug (tests cross-referencing)\n\n"
+        "**Block C** — Direct comparison (tests information balance)"
     )
 
     existing_df = load_queries_df()
@@ -156,15 +162,15 @@ elif page == "2. Generate Queries":
             queries = generate_queries(pairs)
             save_queries(queries)
 
-        brand_q = sum(1 for q in queries if q["is_generic"] is False)
-        generic_q = sum(1 for q in queries if q["is_generic"] is True)
-        comp_q = sum(1 for q in queries if q["is_generic"] == "comparative")
+        condition_q = sum(1 for q in queries if q["query_type"] == "condition")
+        single_q = sum(1 for q in queries if q["query_type"] == "single")
+        comp_q = sum(1 for q in queries if q["query_type"] == "comparative")
 
         st.success(f"Generated **{len(queries)}** queries")
         col1, col2, col3 = st.columns(3)
-        col1.metric("Brand", brand_q)
-        col2.metric("Generic", generic_q)
-        col3.metric("Comparative", comp_q)
+        col1.metric("Block A: Condition", condition_q)
+        col2.metric("Block B: Single-drug", single_q)
+        col3.metric("Block C: Comparative", comp_q)
         st.rerun()
 
 
@@ -245,10 +251,11 @@ elif page == "3. Download Prospectos":
 # ── Page 4: Collect Responses ────────────────────────────────────────────────
 
 elif page == "4. Collect Responses":
-    st.header("Collect MeQA Responses")
+    st.header("Collect Responses")
     st.markdown(
-        "Generate responses automatically using a RAG pipeline "
-        "(prospectos + LLM), or upload manually collected responses."
+        "Send queries to AI models and collect responses. Choose between "
+        "**Commercial Models** (direct, no RAG) for the Drug Mention Audit, "
+        "or the **MeQA RAG Pipeline** (prospectos + LLM)."
     )
 
     resp_count = load_responses_count()
@@ -265,110 +272,205 @@ elif page == "4. Collect Responses":
 
     st.markdown("---")
 
-    # ── Automated RAG collection ──
-    st.subheader("Automated Collection (MeQA RAG Pipeline)")
-    st.markdown(
-        "Simulates the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
-        "(AEMPS, Santamaría 2021) using LangChain:\n\n"
-        "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
-        "**Block 2** — Hybrid Retrieval: BM25 (sparse, like TF-IDF) + FAISS (dense) "
-        "with section-aware filtering\n\n"
-        "**Block 3** — Answer Extraction: context assembly + LLM generation"
+    # ── Collection mode selector ──
+    collection_mode = st.radio(
+        "Collection Method",
+        ["Commercial Models (ChatGPT, Gemini, Perplexity)", "MeQA RAG Pipeline"],
+        index=0,
+        help="Commercial: queries models directly without RAG context (Layer 1 audit). "
+             "RAG: uses prospectos as retrieval context.",
     )
-
-    # Check for API key
-    api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
-    if not api_key:
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
-        )
-
-    prospecto_count = len(list(PROSPECTOS_DIR.glob("*.json"))) - (
-        1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
-    )
-
-    # Pipeline configuration
-    col_cfg1, col_cfg2 = st.columns(2)
-    with col_cfg1:
-        model = st.selectbox(
-            "LLM Model (generation)",
-            ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
-            index=0,
-            help="gpt-4o-mini is recommended (fast and cost-effective).",
-        )
-        top_k = st.slider(
-            "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=12,
-            help="Number of prospecto chunks fed as context to the LLM.",
-        )
-    with col_cfg2:
-        chunk_size = st.selectbox(
-            "Chunk size (chars)", [300, 500, 600, 750, 1000], index=2,
-            help="Smaller chunks = more precise retrieval; larger = more context.",
-        )
-        bm25_weight = st.slider(
-            "BM25 weight (sparse vs dense)", 0.0, 1.0, 0.4, 0.1,
-            help="0.0 = dense only (FAISS), 1.0 = sparse only (BM25). "
-                 "0.4 recommended (like MeQA's TF-IDF + VSM/LSI blend).",
-        )
 
     skip_existing = st.checkbox("Skip already-collected responses", value=True)
 
-    if prospecto_count > 0:
-        st.info(f"**{prospecto_count}** prospectos available as RAG context.")
-    else:
-        st.warning(
-            "No prospectos downloaded yet. The model will answer from general "
-            "pharmaceutical knowledge. For better results, run **Step 3** first."
+    # ══════════════════════════════════════════════════════════════
+    # COMMERCIAL MODELS — Direct queries, no RAG context
+    # ══════════════════════════════════════════════════════════════
+    if collection_mode.startswith("Commercial"):
+        st.subheader("Commercial Model Collection (No RAG)")
+        st.markdown(
+            "Sends queries directly to commercial AI models **without any RAG context**. "
+            "The model responds purely from its parametric knowledge — "
+            "this is the core test for the **Layer 1: Drug Mention Audit**."
         )
 
-    if not api_key:
-        st.info("Enter your OpenAI API key above to enable automated collection.")
-    elif total_queries == 0:
-        st.warning("No query battery found. Run **Step 2** first.")
+        # Provider selection
+        provider = st.selectbox(
+            "Provider",
+            ["openai", "gemini", "perplexity"],
+            format_func=lambda x: {"openai": "OpenAI (ChatGPT)", "gemini": "Google Gemini", "perplexity": "Perplexity"}[x],
+        )
+
+        # Model selection based on provider
+        available_models = PROVIDER_MODELS[provider]
+        model = st.selectbox("Model", available_models, index=0)
+
+        # Provider-specific API key
+        key_labels = {
+            "openai": ("OpenAI API Key", "OPENAI_API_KEY"),
+            "gemini": ("Google Gemini API Key", "GEMINI_API_KEY"),
+            "perplexity": ("Perplexity API Key", "PERPLEXITY_API_KEY"),
+        }
+        key_label, key_env = key_labels[provider]
+
+        api_key = st.secrets.get(key_env, "") if hasattr(st, "secrets") else ""
+        if not api_key:
+            api_key = st.text_input(
+                key_label,
+                type="password",
+                help=f"Set `{key_env}` in .streamlit/secrets.toml or enter here.",
+            )
+
+        # Temperature
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.1,
+                                help="Lower = more deterministic. 0.3 recommended for audit.")
+
+        if not api_key:
+            st.info(f"Enter your {key_label} above to enable collection.")
+        elif total_queries == 0:
+            st.warning("No query battery found. Run **Step 2** first.")
+        else:
+            if st.button("Run Commercial Collection", type="primary"):
+                queries_json = QUERIES_DIR / "query_battery.json"
+                with open(queries_json, encoding="utf-8") as f:
+                    queries_list = json.load(f)
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_progress(current, total):
+                    progress_bar.progress(current / total)
+                    status_text.text(f"Query {current}/{total} — {provider}/{model}")
+
+                try:
+                    status_text.text(f"Connecting to {provider}/{model}...")
+                    collected = collect_commercial_responses(
+                        queries=queries_list,
+                        model=model,
+                        api_key=api_key,
+                        responses_dir=RESPONSES_DIR,
+                        delay=0.5,
+                        temperature=temperature,
+                        skip_existing=skip_existing,
+                        progress_callback=update_progress,
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+                    new_count = len(collected)
+                    total_now = load_responses_count()
+                    st.success(
+                        f"Collected **{new_count}** new responses via {provider}/{model}. "
+                        f"Total: **{total_now}/{total_queries}**"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error(f"Error during commercial collection: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    # RAG PIPELINE — Prospectos + LLM
+    # ══════════════════════════════════════════════════════════════
     else:
-        if st.button("Run MeQA RAG Collection", type="primary"):
-            queries_json = QUERIES_DIR / "query_battery.json"
-            with open(queries_json, encoding="utf-8") as f:
-                queries_list = json.load(f)
+        st.subheader("MeQA RAG Pipeline Collection")
+        st.markdown(
+            "Simulates the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
+            "(AEMPS, Santamaría 2021) using LangChain:\n\n"
+            "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
+            "**Block 2** — Hybrid Retrieval: BM25 (sparse, like TF-IDF) + FAISS (dense) "
+            "with section-aware filtering\n\n"
+            "**Block 3** — Answer Extraction: context assembly + LLM generation"
+        )
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
+        if not api_key:
+            api_key = st.text_input(
+                "OpenAI API Key",
+                type="password",
+                help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
+            )
 
-            def update_progress(current, total):
-                progress_bar.progress(current / total)
-                status_text.text(f"Processing query {current}/{total}...")
+        prospecto_count = len(list(PROSPECTOS_DIR.glob("*.json"))) - (
+            1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
+        )
 
-            try:
-                status_text.text("Building hybrid retriever (BM25 + FAISS)...")
-                collected = rag_collect(
-                    queries=queries_list,
-                    api_key=api_key,
-                    model=model,
-                    prospectos_dir=PROSPECTOS_DIR,
-                    responses_dir=RESPONSES_DIR,
-                    chunk_size=chunk_size,
-                    chunk_overlap=80,
-                    top_k=top_k,
-                    bm25_weight=bm25_weight,
-                    delay=0.3,
-                    progress_callback=update_progress,
-                    skip_existing=skip_existing,
-                )
-                progress_bar.empty()
-                status_text.empty()
-                new_count = len(collected)
-                total_now = load_responses_count()
-                st.success(
-                    f"Collected **{new_count}** new responses. "
-                    f"Total: **{total_now}/{total_queries}**"
-                )
-                st.rerun()
-            except Exception as e:
-                progress_bar.empty()
-                status_text.empty()
-                st.error(f"Error during RAG collection: {e}")
+        col_cfg1, col_cfg2 = st.columns(2)
+        with col_cfg1:
+            model = st.selectbox(
+                "LLM Model (generation)",
+                ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
+                index=0,
+                help="gpt-4o-mini is recommended (fast and cost-effective).",
+            )
+            top_k = st.slider(
+                "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=12,
+                help="Number of prospecto chunks fed as context to the LLM.",
+            )
+        with col_cfg2:
+            chunk_size = st.selectbox(
+                "Chunk size (chars)", [300, 500, 600, 750, 1000], index=2,
+                help="Smaller chunks = more precise retrieval; larger = more context.",
+            )
+            bm25_weight = st.slider(
+                "BM25 weight (sparse vs dense)", 0.0, 1.0, 0.4, 0.1,
+                help="0.0 = dense only (FAISS), 1.0 = sparse only (BM25). "
+                     "0.4 recommended (like MeQA's TF-IDF + VSM/LSI blend).",
+            )
+
+        if prospecto_count > 0:
+            st.info(f"**{prospecto_count}** prospectos available as RAG context.")
+        else:
+            st.warning(
+                "No prospectos downloaded yet. The model will answer from general "
+                "pharmaceutical knowledge. For better results, run **Step 3** first."
+            )
+
+        if not api_key:
+            st.info("Enter your OpenAI API key above to enable automated collection.")
+        elif total_queries == 0:
+            st.warning("No query battery found. Run **Step 2** first.")
+        else:
+            if st.button("Run MeQA RAG Collection", type="primary"):
+                queries_json = QUERIES_DIR / "query_battery.json"
+                with open(queries_json, encoding="utf-8") as f:
+                    queries_list = json.load(f)
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_progress(current, total):
+                    progress_bar.progress(current / total)
+                    status_text.text(f"Processing query {current}/{total}...")
+
+                try:
+                    status_text.text("Building hybrid retriever (BM25 + FAISS)...")
+                    collected = rag_collect(
+                        queries=queries_list,
+                        api_key=api_key,
+                        model=model,
+                        prospectos_dir=PROSPECTOS_DIR,
+                        responses_dir=RESPONSES_DIR,
+                        chunk_size=chunk_size,
+                        chunk_overlap=80,
+                        top_k=top_k,
+                        bm25_weight=bm25_weight,
+                        delay=0.3,
+                        progress_callback=update_progress,
+                        skip_existing=skip_existing,
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+                    new_count = len(collected)
+                    total_now = load_responses_count()
+                    st.success(
+                        f"Collected **{new_count}** new responses. "
+                        f"Total: **{total_now}/{total_queries}**"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error(f"Error during RAG collection: {e}")
 
     st.markdown("---")
 
@@ -493,11 +595,11 @@ elif page == "4. Collect Responses":
 # ── Page 5: Analyze Responses ────────────────────────────────────────────────
 
 elif page == "5. Analyze Responses":
-    st.header("Analyze Responses (NLP Coding)")
+    st.header("Analyze Responses (Drug Mention Audit)")
     st.markdown(
-        "Codes each MeQA response into quantitative metrics: "
-        "word count, completeness, safety signals, professional referrals, "
-        "and bioequivalence awareness."
+        "Codes each response into mention-based metrics: "
+        "brand/generic mention counts, first-mention position, "
+        "cross-reference detection, and computes asymmetry scores per pair."
     )
 
     resp_count = load_responses_count()
@@ -531,46 +633,58 @@ elif page == "5. Analyze Responses":
         st.markdown("---")
         st.subheader("Overview")
 
-        brand = metrics_df[metrics_df["is_generic"].astype(str) == "False"]
-        generic = metrics_df[metrics_df["is_generic"].astype(str) == "True"]
-        comp = metrics_df[metrics_df["is_generic"].astype(str) == "comparative"]
+        condition = metrics_df[metrics_df["query_type"] == "condition"]
+        single = metrics_df[metrics_df["query_type"] == "single"]
+        comp = metrics_df[metrics_df["query_type"] == "comparative"]
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Brand Responses", len(brand))
-        col2.metric("Generic Responses", len(generic))
-        col3.metric("Comparative Responses", len(comp))
+        col1.metric("Block A: Condition", len(condition))
+        col2.metric("Block B: Single-drug", len(single))
+        col3.metric("Block C: Comparative", len(comp))
 
-        if not brand.empty and not generic.empty:
-            st.markdown("#### Word Count Comparison")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Avg Brand Words", f"{brand['word_count'].mean():.0f}")
-            col2.metric("Avg Generic Words", f"{generic['word_count'].mean():.0f}")
-            diff = brand['word_count'].mean() - generic['word_count'].mean()
-            col3.metric("Difference", f"{diff:+.0f}")
+        st.markdown("#### Drug Mention Summary")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Brand Mentioned",
+                     f"{metrics_df['brand_mentioned'].sum()}/{len(metrics_df)}")
+        col2.metric("Generic Mentioned",
+                     f"{metrics_df['generic_mentioned'].sum()}/{len(metrics_df)}")
+        total_brand = metrics_df["brand_mention_count"].sum()
+        total_generic = metrics_df["generic_mention_count"].sum()
+        col3.metric("Total Brand Mentions", int(total_brand))
+        col4.metric("Total Generic Mentions", int(total_generic))
 
-            st.markdown("#### Completeness Score (0-6)")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Avg Brand", f"{brand['completeness_score'].mean():.2f}")
-            col2.metric("Avg Generic", f"{generic['completeness_score'].mean():.2f}")
-            diff_c = brand['completeness_score'].mean() - generic['completeness_score'].mean()
-            col3.metric("Difference", f"{diff_c:+.2f}")
+        st.markdown("#### First-Mentioned Advantage")
+        brand_first = (metrics_df["first_drug_mentioned"] == "brand").sum()
+        generic_first = (metrics_df["first_drug_mentioned"] == "generic").sum()
+        neither = (metrics_df["first_drug_mentioned"] == "neither").sum()
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Brand First", brand_first)
+        col2.metric("Generic First", generic_first)
+        col3.metric("Neither", neither)
 
-            # Chart: word count by drug type
-            st.markdown("#### Word Count Distribution")
-            chart_data = pd.DataFrame({
-                "Brand": brand["word_count"].values,
-            })
-            chart_data2 = pd.DataFrame({
-                "Generic": generic["word_count"].values,
-            })
+        # Mention counts by query type
+        st.markdown("#### Mentions by Query Type")
+        mention_by_type = metrics_df.groupby("query_type").agg(
+            n=("query_id", "count"),
+            brand_mentions=("brand_mention_count", "sum"),
+            generic_mentions=("generic_mention_count", "sum"),
+            brand_pct=("brand_mentioned", "mean"),
+            generic_pct=("generic_mentioned", "mean"),
+        ).reset_index()
+        mention_by_type["brand_pct"] = (mention_by_type["brand_pct"] * 100).round(0).astype(int).astype(str) + "%"
+        mention_by_type["generic_pct"] = (mention_by_type["generic_pct"] * 100).round(0).astype(int).astype(str) + "%"
+        st.dataframe(mention_by_type, use_container_width=True, hide_index=True)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.bar_chart(brand.groupby("query_category")["word_count"].mean(), horizontal=True)
-                st.caption("Brand — Avg words by category")
-            with col2:
-                st.bar_chart(generic.groupby("query_category")["word_count"].mean(), horizontal=True)
-                st.caption("Generic — Avg words by category")
+        # Asymmetry scores
+        asym_file = ANALYSIS_DIR / "asymmetry_scores.csv"
+        if asym_file.exists():
+            st.markdown("---")
+            st.subheader("Asymmetry Scores (per drug pair)")
+            asym_df = pd.read_csv(asym_file)
+            st.dataframe(asym_df, use_container_width=True, hide_index=True)
+
+            if not asym_df.empty:
+                st.bar_chart(asym_df.set_index("pair_id")["composite_asymmetry_score"])
 
         # Download
         csv_data = metrics_df.to_csv(index=False).encode("utf-8")
@@ -582,8 +696,8 @@ elif page == "5. Analyze Responses":
 elif page == "6. Statistical Analysis":
     st.header("Statistical Hypothesis Testing")
     st.markdown(
-        "Non-parametric tests for information asymmetry between "
-        "brand-name and generic drug responses."
+        "Non-parametric tests for drug mention asymmetry between "
+        "brand-name and generic drugs."
     )
 
     metrics_df = load_metrics_df()
@@ -596,180 +710,168 @@ elif page == "6. Statistical Analysis":
         import numpy as np
         from scipy import stats
 
-        tabs = st.tabs(["H1: Completeness", "H2: Accuracy", "H3: Comparative Bias", "H4: Therapeutic Variation", "Summary"])
+        tabs = st.tabs(["H1: Mention Asymmetry", "H2: Position Advantage",
+                         "H3: Cross-Reference", "H4: Condition Visibility",
+                         "H5: Therapeutic Variation", "Summary"])
 
-        # ── H1 ──
+        # ── H1: Mention Asymmetry ──
         with tabs[0]:
-            st.subheader("H1: Brand responses are more complete than generic")
-            st.markdown("**Test:** Wilcoxon signed-rank (paired, non-parametric)")
+            st.subheader("H1: Brand drugs mentioned more often than generics")
+            st.markdown("**Test:** Wilcoxon signed-rank on per-pair mention counts")
 
-            factual = metrics_df[metrics_df["query_type"] == "factual"].copy()
-            brand = factual[factual["is_generic"].astype(str) == "False"]
-            generic = factual[factual["is_generic"].astype(str) == "True"]
-
-            brand_agg = brand.groupby(["pair_id", "query_category"]).agg(
-                word_count=("word_count", "mean"),
-                completeness=("completeness_score", "mean"),
-                ae_named=("adverse_effects_named", "mean"),
-            ).reset_index()
-
-            generic_agg = generic.groupby(["pair_id", "query_category"]).agg(
-                word_count=("word_count", "mean"),
-                completeness=("completeness_score", "mean"),
-                ae_named=("adverse_effects_named", "mean"),
-            ).reset_index()
-
-            merged = brand_agg.merge(
-                generic_agg, on=["pair_id", "query_category"], suffixes=("_brand", "_generic")
-            )
-
-            results = []
-            for metric in ["word_count", "completeness", "ae_named"]:
-                b = merged[f"{metric}_brand"].values
-                g = merged[f"{metric}_generic"].values
-                if len(b) >= 5:
-                    w, p = stats.wilcoxon(b, g)
-                    d = np.median(b - g)
-                    results.append({
-                        "Metric": metric,
-                        "Brand Mean": f"{np.mean(b):.2f}",
-                        "Generic Mean": f"{np.mean(g):.2f}",
-                        "Wilcoxon W": f"{w:.4f}",
-                        "p-value": f"{p:.6f}",
-                        "Median Diff": f"{d:+.2f}",
-                        "Significant": "Yes" if p < 0.05 else "No",
-                    })
-
-            if results:
-                st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-            else:
-                st.warning("Insufficient paired data for Wilcoxon test (need >= 5 pairs).")
-
-        # ── H2 ──
-        with tabs[1]:
-            st.subheader("H2: Differential Accuracy")
-            st.markdown(
-                "Accuracy requires manual coding against ground truth prospectos. "
-                "Download the template, fill in scores, and re-upload."
-            )
-
-            template = metrics_df[["query_id", "pair_id", "drug_name", "is_generic",
-                                    "query_category"]].copy()
-            template["accuracy_score"] = ""
-            template["error_type"] = ""
-            template["coder"] = ""
-            template["notes"] = ""
-
-            csv = template.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download Accuracy Coding Template",
-                csv, "accuracy_coding_template.csv", "text/csv"
-            )
-
-            st.markdown("---")
-            st.markdown(
-                "**Scoring guide:**\n"
-                "- 1 = Accurate\n"
-                "- 2 = Partially accurate\n"
-                "- 3 = Omission\n"
-                "- 4 = Error/hallucination"
-            )
-
-        # ── H3 ──
-        with tabs[2]:
-            st.subheader("H3: Framing Bias in Comparative Queries")
-
-            comp = metrics_df[metrics_df["query_type"] == "comparative"].copy()
-            if comp.empty:
-                st.warning("No comparative responses found.")
-            else:
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Comparative", len(comp))
-                col2.metric("Mentions Bioequivalence",
-                            f"{comp['mentions_bioequivalence'].sum()} ({comp['mentions_bioequivalence'].mean()*100:.0f}%)")
-                col3.metric("Avg Word Count", f"{comp['word_count'].mean():.0f}")
-
-                st.markdown("#### By Category")
-                cat_stats = comp.groupby("query_category").agg(
-                    n=("query_id", "count"),
-                    avg_words=("word_count", "mean"),
-                    bioequiv_pct=("mentions_bioequivalence", "mean"),
-                    professional_pct=("mentions_professional", "mean"),
-                ).reset_index()
-                cat_stats["bioequiv_pct"] = (cat_stats["bioequiv_pct"] * 100).round(0).astype(int).astype(str) + "%"
-                cat_stats["professional_pct"] = (cat_stats["professional_pct"] * 100).round(0).astype(int).astype(str) + "%"
-                st.dataframe(cat_stats, use_container_width=True, hide_index=True)
-
-        # ── H4 ──
-        with tabs[3]:
-            st.subheader("H4: Asymmetry Varies by Therapeutic Area")
-
-            factual = metrics_df[metrics_df["query_type"] == "factual"].copy()
-            pair_ids = factual["pair_id"].unique()
+            pairs = metrics_df["pair_id"].unique()
             rows = []
-
-            for pid in pair_ids:
-                p = factual[factual["pair_id"] == pid]
-                b_wc = p[p["is_generic"].astype(str) == "False"]["word_count"].mean()
-                g_wc = p[p["is_generic"].astype(str) == "True"]["word_count"].mean()
-                if not (np.isnan(b_wc) or np.isnan(g_wc)):
-                    rows.append({
-                        "Pair ID": pid,
-                        "Brand Avg Words": round(b_wc, 1),
-                        "Generic Avg Words": round(g_wc, 1),
-                        "Asymmetry (B-G)": round(b_wc - g_wc, 1),
-                    })
+            for pid in pairs:
+                p = metrics_df[metrics_df["pair_id"] == pid]
+                rows.append({
+                    "Pair ID": pid,
+                    "Brand Mentions": int(p["brand_mention_count"].sum()),
+                    "Generic Mentions": int(p["generic_mention_count"].sum()),
+                    "Difference": int(p["brand_mention_count"].sum() - p["generic_mention_count"].sum()),
+                })
 
             if rows:
-                asym_df = pd.DataFrame(rows)
-                st.dataframe(asym_df, use_container_width=True, hide_index=True)
+                agg = pd.DataFrame(rows)
+                st.dataframe(agg, use_container_width=True, hide_index=True)
 
-                asym_vals = asym_df["Asymmetry (B-G)"].values
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Mean Asymmetry", f"{np.mean(asym_vals):+.1f}")
-                col2.metric("Median Asymmetry", f"{np.median(asym_vals):+.1f}")
-                col3.metric("Std Dev", f"{np.std(asym_vals):.1f}")
-
-                if len(asym_vals) >= 5:
-                    w, p = stats.wilcoxon(asym_vals)
+                if len(agg) >= 5:
+                    w, p = stats.wilcoxon(agg["Brand Mentions"].values, agg["Generic Mentions"].values)
                     st.markdown(
-                        f"**One-sample Wilcoxon** (H0: median=0): "
-                        f"W={w:.4f}, p={p:.6f} — "
+                        f"**Wilcoxon signed-rank:** W={w:.4f}, p={p:.6f} — "
                         f"{'**Significant**' if p < 0.05 else 'Not significant'} (alpha=0.05)"
                     )
 
-                st.bar_chart(asym_df.set_index("Pair ID")["Asymmetry (B-G)"])
+        # ── H2: Position Advantage ──
+        with tabs[1]:
+            st.subheader("H2: Brand drugs appear earlier in responses")
+            st.markdown("**Test:** Binomial test on first-mention proportion")
+
+            brand_first = (metrics_df["first_drug_mentioned"] == "brand").sum()
+            generic_first = (metrics_df["first_drug_mentioned"] == "generic").sum()
+            neither = (metrics_df["first_drug_mentioned"] == "neither").sum()
+            total = brand_first + generic_first
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Brand First", brand_first)
+            col2.metric("Generic First", generic_first)
+            col3.metric("Neither", neither)
+
+            if total > 0:
+                ratio = brand_first / total
+                st.metric("Brand-First Ratio", f"{ratio:.4f}", help="0.5 = no advantage")
+                result = stats.binomtest(brand_first, total, p=0.5, alternative="greater")
+                st.markdown(
+                    f"**Binomial test** (H0: ratio=0.5): p={result.pvalue:.6f} — "
+                    f"{'**Significant**' if result.pvalue < 0.05 else 'Not significant'} (alpha=0.05)"
+                )
+
+        # ── H3: Cross-Reference ──
+        with tabs[2]:
+            st.subheader("H3: Cross-Reference Asymmetry")
+            st.markdown(
+                "When querying about one drug, does the paired drug get mentioned? "
+                "Measures directional cross-reference probability."
+            )
+
+            single = metrics_df[metrics_df["query_type"] == "single"]
+            brand_queried = single[single["is_generic"].astype(str) == "False"]
+            generic_queried = single[single["is_generic"].astype(str) == "True"]
+
+            if not brand_queried.empty or not generic_queried.empty:
+                col1, col2 = st.columns(2)
+                if not generic_queried.empty:
+                    p_bg = generic_queried["brand_mentioned"].mean()
+                    col1.metric("P(brand | generic queried)", f"{p_bg:.4f}")
+                if not brand_queried.empty:
+                    p_gb = brand_queried["generic_mentioned"].mean()
+                    col2.metric("P(generic | brand queried)", f"{p_gb:.4f}")
+
+                a = int(generic_queried["brand_mentioned"].sum()) if not generic_queried.empty else 0
+                b = len(generic_queried) - a
+                c = int(brand_queried["generic_mentioned"].sum()) if not brand_queried.empty else 0
+                d = len(brand_queried) - c
+
+                if a + b > 0 and c + d > 0:
+                    odds_ratio, p = stats.fisher_exact([[a, b], [c, d]])
+                    st.markdown(
+                        f"**Fisher's exact test:** OR={odds_ratio:.4f}, p={p:.6f} — "
+                        f"{'**Significant**' if p < 0.05 else 'Not significant'} (alpha=0.05)"
+                    )
             else:
-                st.warning("Insufficient data to compute asymmetry by pair.")
+                st.warning("No single-drug queries found.")
+
+        # ── H4: Condition Visibility ──
+        with tabs[3]:
+            st.subheader("H4: Condition-First Query Visibility")
+            st.markdown(
+                "When no drug name is in the prompt, which drugs does the model mention?"
+            )
+
+            condition = metrics_df[metrics_df["query_type"] == "condition"]
+            if condition.empty:
+                st.warning("No condition-first responses found.")
+            else:
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Responses", len(condition))
+                col2.metric("Brand Mentioned",
+                            f"{condition['brand_mentioned'].sum()} ({condition['brand_mentioned'].mean()*100:.0f}%)")
+                col3.metric("Generic Mentioned",
+                            f"{condition['generic_mentioned'].sum()} ({condition['generic_mentioned'].mean()*100:.0f}%)")
+
+        # ── H5: Therapeutic Variation ──
+        with tabs[4]:
+            st.subheader("H5: Asymmetry Varies by Therapeutic Area")
+
+            asym_file = ANALYSIS_DIR / "asymmetry_scores.csv"
+            if asym_file.exists():
+                asym_df = pd.read_csv(asym_file)
+                st.dataframe(asym_df, use_container_width=True, hide_index=True)
+
+                cas = asym_df["composite_asymmetry_score"].values
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Mean CAS", f"{np.mean(cas):.4f}")
+                col2.metric("Median CAS", f"{np.median(cas):.4f}")
+                col3.metric("Std CAS", f"{np.std(cas):.4f}")
+
+                if len(cas) >= 5:
+                    w, p = stats.wilcoxon(cas - 0.5)
+                    st.markdown(
+                        f"**Wilcoxon** (H0: median CAS=0.5): W={w:.4f}, p={p:.6f} — "
+                        f"{'**Significant**' if p < 0.05 else 'Not significant'}"
+                    )
+
+                st.bar_chart(asym_df.set_index("pair_id")["composite_asymmetry_score"])
+            else:
+                st.warning("No asymmetry scores found. Run **Step 5** first.")
 
         # ── Summary ──
-        with tabs[4]:
+        with tabs[5]:
             st.subheader("Overall Summary")
 
-            for label, filt in [("Brand", "False"), ("Generic", "True"), ("Comparative", "comparative")]:
-                sub = metrics_df[metrics_df["is_generic"].astype(str) == filt]
+            for label, filt in [("Condition", "condition"), ("Single-drug", "single"), ("Comparative", "comparative")]:
+                sub = metrics_df[metrics_df["query_type"] == filt]
                 if sub.empty:
                     continue
 
                 st.markdown(f"#### {label} (n={len(sub)})")
                 stats_rows = []
-                for col in ["word_count", "completeness_score", "safety_warnings_count", "adverse_effects_named"]:
-                    stats_rows.append({
-                        "Metric": col,
-                        "Mean": f"{sub[col].mean():.2f}",
-                        "Std": f"{sub[col].std():.2f}",
-                        "Median": f"{sub[col].median():.1f}",
-                        "Min": f"{sub[col].min():.0f}",
-                        "Max": f"{sub[col].max():.0f}",
-                    })
+                for col_name in ["brand_mention_count", "generic_mention_count",
+                                  "response_word_count", "safety_warnings_count"]:
+                    if col_name in sub.columns:
+                        stats_rows.append({
+                            "Metric": col_name,
+                            "Mean": f"{sub[col_name].mean():.2f}",
+                            "Std": f"{sub[col_name].std():.2f}",
+                            "Median": f"{sub[col_name].median():.1f}",
+                        })
                 st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
 
-            # Download full summary
-            summary_data = metrics_df.groupby("is_generic").agg({
-                "word_count": ["mean", "std", "median"],
-                "completeness_score": ["mean", "std"],
-                "safety_warnings_count": ["mean", "std"],
-                "adverse_effects_named": ["mean", "std"],
+            summary_data = metrics_df.groupby("query_type").agg({
+                "brand_mentioned": ["sum", "mean"],
+                "generic_mentioned": ["sum", "mean"],
+                "brand_mention_count": ["mean", "std"],
+                "generic_mention_count": ["mean", "std"],
+                "response_word_count": ["mean", "std", "median"],
             })
-            csv = summary_data.to_csv().encode("utf-8")
-            st.download_button("Download Summary CSV", csv, "summary_report.csv", "text/csv")
+            csv_summary = summary_data.to_csv().encode("utf-8")
+            st.download_button("Download Summary CSV", csv_summary, "summary_report.csv", "text/csv")
