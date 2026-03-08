@@ -23,6 +23,10 @@ from src.query_generator import generate_queries, save_queries
 from src.response_analyzer import analyze_response, analyze_all_responses, compute_asymmetry_scores
 from src.cima_client import CIMAClient
 from src.rag_engine import collect_all_responses as rag_collect
+from src.commercial_collector import (
+    collect_commercial_responses, detect_provider,
+    PROVIDER_MODELS, get_all_models,
+)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -247,10 +251,11 @@ elif page == "3. Download Prospectos":
 # ── Page 4: Collect Responses ────────────────────────────────────────────────
 
 elif page == "4. Collect Responses":
-    st.header("Collect MeQA Responses")
+    st.header("Collect Responses")
     st.markdown(
-        "Generate responses automatically using a RAG pipeline "
-        "(prospectos + LLM), or upload manually collected responses."
+        "Send queries to AI models and collect responses. Choose between "
+        "**Commercial Models** (direct, no RAG) for the Drug Mention Audit, "
+        "or the **MeQA RAG Pipeline** (prospectos + LLM)."
     )
 
     resp_count = load_responses_count()
@@ -267,110 +272,205 @@ elif page == "4. Collect Responses":
 
     st.markdown("---")
 
-    # ── Automated RAG collection ──
-    st.subheader("Automated Collection (MeQA RAG Pipeline)")
-    st.markdown(
-        "Simulates the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
-        "(AEMPS, Santamaría 2021) using LangChain:\n\n"
-        "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
-        "**Block 2** — Hybrid Retrieval: BM25 (sparse, like TF-IDF) + FAISS (dense) "
-        "with section-aware filtering\n\n"
-        "**Block 3** — Answer Extraction: context assembly + LLM generation"
+    # ── Collection mode selector ──
+    collection_mode = st.radio(
+        "Collection Method",
+        ["Commercial Models (ChatGPT, Gemini, Perplexity)", "MeQA RAG Pipeline"],
+        index=0,
+        help="Commercial: queries models directly without RAG context (Layer 1 audit). "
+             "RAG: uses prospectos as retrieval context.",
     )
-
-    # Check for API key
-    api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
-    if not api_key:
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
-        )
-
-    prospecto_count = len(list(PROSPECTOS_DIR.glob("*.json"))) - (
-        1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
-    )
-
-    # Pipeline configuration
-    col_cfg1, col_cfg2 = st.columns(2)
-    with col_cfg1:
-        model = st.selectbox(
-            "LLM Model (generation)",
-            ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
-            index=0,
-            help="gpt-4o-mini is recommended (fast and cost-effective).",
-        )
-        top_k = st.slider(
-            "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=12,
-            help="Number of prospecto chunks fed as context to the LLM.",
-        )
-    with col_cfg2:
-        chunk_size = st.selectbox(
-            "Chunk size (chars)", [300, 500, 600, 750, 1000], index=2,
-            help="Smaller chunks = more precise retrieval; larger = more context.",
-        )
-        bm25_weight = st.slider(
-            "BM25 weight (sparse vs dense)", 0.0, 1.0, 0.4, 0.1,
-            help="0.0 = dense only (FAISS), 1.0 = sparse only (BM25). "
-                 "0.4 recommended (like MeQA's TF-IDF + VSM/LSI blend).",
-        )
 
     skip_existing = st.checkbox("Skip already-collected responses", value=True)
 
-    if prospecto_count > 0:
-        st.info(f"**{prospecto_count}** prospectos available as RAG context.")
-    else:
-        st.warning(
-            "No prospectos downloaded yet. The model will answer from general "
-            "pharmaceutical knowledge. For better results, run **Step 3** first."
+    # ══════════════════════════════════════════════════════════════
+    # COMMERCIAL MODELS — Direct queries, no RAG context
+    # ══════════════════════════════════════════════════════════════
+    if collection_mode.startswith("Commercial"):
+        st.subheader("Commercial Model Collection (No RAG)")
+        st.markdown(
+            "Sends queries directly to commercial AI models **without any RAG context**. "
+            "The model responds purely from its parametric knowledge — "
+            "this is the core test for the **Layer 1: Drug Mention Audit**."
         )
 
-    if not api_key:
-        st.info("Enter your OpenAI API key above to enable automated collection.")
-    elif total_queries == 0:
-        st.warning("No query battery found. Run **Step 2** first.")
+        # Provider selection
+        provider = st.selectbox(
+            "Provider",
+            ["openai", "gemini", "perplexity"],
+            format_func=lambda x: {"openai": "OpenAI (ChatGPT)", "gemini": "Google Gemini", "perplexity": "Perplexity"}[x],
+        )
+
+        # Model selection based on provider
+        available_models = PROVIDER_MODELS[provider]
+        model = st.selectbox("Model", available_models, index=0)
+
+        # Provider-specific API key
+        key_labels = {
+            "openai": ("OpenAI API Key", "OPENAI_API_KEY"),
+            "gemini": ("Google Gemini API Key", "GEMINI_API_KEY"),
+            "perplexity": ("Perplexity API Key", "PERPLEXITY_API_KEY"),
+        }
+        key_label, key_env = key_labels[provider]
+
+        api_key = st.secrets.get(key_env, "") if hasattr(st, "secrets") else ""
+        if not api_key:
+            api_key = st.text_input(
+                key_label,
+                type="password",
+                help=f"Set `{key_env}` in .streamlit/secrets.toml or enter here.",
+            )
+
+        # Temperature
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.1,
+                                help="Lower = more deterministic. 0.3 recommended for audit.")
+
+        if not api_key:
+            st.info(f"Enter your {key_label} above to enable collection.")
+        elif total_queries == 0:
+            st.warning("No query battery found. Run **Step 2** first.")
+        else:
+            if st.button("Run Commercial Collection", type="primary"):
+                queries_json = QUERIES_DIR / "query_battery.json"
+                with open(queries_json, encoding="utf-8") as f:
+                    queries_list = json.load(f)
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_progress(current, total):
+                    progress_bar.progress(current / total)
+                    status_text.text(f"Query {current}/{total} — {provider}/{model}")
+
+                try:
+                    status_text.text(f"Connecting to {provider}/{model}...")
+                    collected = collect_commercial_responses(
+                        queries=queries_list,
+                        model=model,
+                        api_key=api_key,
+                        responses_dir=RESPONSES_DIR,
+                        delay=0.5,
+                        temperature=temperature,
+                        skip_existing=skip_existing,
+                        progress_callback=update_progress,
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+                    new_count = len(collected)
+                    total_now = load_responses_count()
+                    st.success(
+                        f"Collected **{new_count}** new responses via {provider}/{model}. "
+                        f"Total: **{total_now}/{total_queries}**"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error(f"Error during commercial collection: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    # RAG PIPELINE — Prospectos + LLM
+    # ══════════════════════════════════════════════════════════════
     else:
-        if st.button("Run MeQA RAG Collection", type="primary"):
-            queries_json = QUERIES_DIR / "query_battery.json"
-            with open(queries_json, encoding="utf-8") as f:
-                queries_list = json.load(f)
+        st.subheader("MeQA RAG Pipeline Collection")
+        st.markdown(
+            "Simulates the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
+            "(AEMPS, Santamaría 2021) using LangChain:\n\n"
+            "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
+            "**Block 2** — Hybrid Retrieval: BM25 (sparse, like TF-IDF) + FAISS (dense) "
+            "with section-aware filtering\n\n"
+            "**Block 3** — Answer Extraction: context assembly + LLM generation"
+        )
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
+        if not api_key:
+            api_key = st.text_input(
+                "OpenAI API Key",
+                type="password",
+                help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
+            )
 
-            def update_progress(current, total):
-                progress_bar.progress(current / total)
-                status_text.text(f"Processing query {current}/{total}...")
+        prospecto_count = len(list(PROSPECTOS_DIR.glob("*.json"))) - (
+            1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
+        )
 
-            try:
-                status_text.text("Building hybrid retriever (BM25 + FAISS)...")
-                collected = rag_collect(
-                    queries=queries_list,
-                    api_key=api_key,
-                    model=model,
-                    prospectos_dir=PROSPECTOS_DIR,
-                    responses_dir=RESPONSES_DIR,
-                    chunk_size=chunk_size,
-                    chunk_overlap=80,
-                    top_k=top_k,
-                    bm25_weight=bm25_weight,
-                    delay=0.3,
-                    progress_callback=update_progress,
-                    skip_existing=skip_existing,
-                )
-                progress_bar.empty()
-                status_text.empty()
-                new_count = len(collected)
-                total_now = load_responses_count()
-                st.success(
-                    f"Collected **{new_count}** new responses. "
-                    f"Total: **{total_now}/{total_queries}**"
-                )
-                st.rerun()
-            except Exception as e:
-                progress_bar.empty()
-                status_text.empty()
-                st.error(f"Error during RAG collection: {e}")
+        col_cfg1, col_cfg2 = st.columns(2)
+        with col_cfg1:
+            model = st.selectbox(
+                "LLM Model (generation)",
+                ["gpt-4o-mini", "gpt-3.5-turbo", "gpt-4o"],
+                index=0,
+                help="gpt-4o-mini is recommended (fast and cost-effective).",
+            )
+            top_k = st.slider(
+                "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=12,
+                help="Number of prospecto chunks fed as context to the LLM.",
+            )
+        with col_cfg2:
+            chunk_size = st.selectbox(
+                "Chunk size (chars)", [300, 500, 600, 750, 1000], index=2,
+                help="Smaller chunks = more precise retrieval; larger = more context.",
+            )
+            bm25_weight = st.slider(
+                "BM25 weight (sparse vs dense)", 0.0, 1.0, 0.4, 0.1,
+                help="0.0 = dense only (FAISS), 1.0 = sparse only (BM25). "
+                     "0.4 recommended (like MeQA's TF-IDF + VSM/LSI blend).",
+            )
+
+        if prospecto_count > 0:
+            st.info(f"**{prospecto_count}** prospectos available as RAG context.")
+        else:
+            st.warning(
+                "No prospectos downloaded yet. The model will answer from general "
+                "pharmaceutical knowledge. For better results, run **Step 3** first."
+            )
+
+        if not api_key:
+            st.info("Enter your OpenAI API key above to enable automated collection.")
+        elif total_queries == 0:
+            st.warning("No query battery found. Run **Step 2** first.")
+        else:
+            if st.button("Run MeQA RAG Collection", type="primary"):
+                queries_json = QUERIES_DIR / "query_battery.json"
+                with open(queries_json, encoding="utf-8") as f:
+                    queries_list = json.load(f)
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_progress(current, total):
+                    progress_bar.progress(current / total)
+                    status_text.text(f"Processing query {current}/{total}...")
+
+                try:
+                    status_text.text("Building hybrid retriever (BM25 + FAISS)...")
+                    collected = rag_collect(
+                        queries=queries_list,
+                        api_key=api_key,
+                        model=model,
+                        prospectos_dir=PROSPECTOS_DIR,
+                        responses_dir=RESPONSES_DIR,
+                        chunk_size=chunk_size,
+                        chunk_overlap=80,
+                        top_k=top_k,
+                        bm25_weight=bm25_weight,
+                        delay=0.3,
+                        progress_callback=update_progress,
+                        skip_existing=skip_existing,
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+                    new_count = len(collected)
+                    total_now = load_responses_count()
+                    st.success(
+                        f"Collected **{new_count}** new responses. "
+                        f"Total: **{total_now}/{total_queries}**"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error(f"Error during RAG collection: {e}")
 
     st.markdown("---")
 
