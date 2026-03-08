@@ -39,6 +39,7 @@ class DrugPair:
 
 
 # ── Pre-defined pairs (offline mode) ────────────────────────────────────────
+# Each pair includes condition/symptom for Layer 1 condition-first queries.
 
 OFFLINE_PAIRS = [
     {
@@ -46,6 +47,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Omeprazol 20mg",
         "grupo": "Gastrointestinal",
         "atc": "A02BC01",
+        "condition": "acidez gástrica y reflujo gastroesofágico",
+        "symptom": "la acidez de estómago",
         "brand": "LOSEC 20 MG CAPSULAS DURAS GASTRORRESISTENTES",
         "generics": [
             "OMEPRAZOL CINFA 20 MG CAPSULAS DURAS GASTRORRESISTENTES EFG",
@@ -57,6 +60,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Atorvastatina 20mg",
         "grupo": "Cardiovascular",
         "atc": "C10AA05",
+        "condition": "hipercolesterolemia",
+        "symptom": "el colesterol alto",
         "brand": "CARDYL 20 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
         "generics": [
             "ATORVASTATINA CINFA 20 MG COMPRIMIDOS RECUBIERTOS CON PELICULA EFG",
@@ -68,6 +73,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Escitalopram 10mg",
         "grupo": "SNC - Antidepresivos",
         "atc": "N06AB10",
+        "condition": "depresión y trastorno de ansiedad generalizada",
+        "symptom": "la depresión y la ansiedad",
         "brand": "CIPRALEX 10 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
         "generics": [
             "ESCITALOPRAM CINFA 10 MG COMPRIMIDOS RECUBIERTOS CON PELICULA EFG",
@@ -79,6 +86,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Amoxicilina 500mg",
         "grupo": "Antiinfecciosos",
         "atc": "J01CA04",
+        "condition": "infecciones bacterianas",
+        "symptom": "una infección bacteriana",
         "brand": "CLAMOXYL 500 MG CAPSULAS DURAS",
         "generics": [
             "AMOXICILINA CINFA 500 MG CAPSULAS DURAS EFG",
@@ -90,6 +99,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Ibuprofeno 600mg",
         "grupo": "Antiinflamatorio",
         "atc": "M01AE01",
+        "condition": "dolor e inflamación",
+        "symptom": "el dolor y la inflamación",
         "brand": "NEOBRUFEN 600 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
         "generics": [
             "IBUPROFENO CINFA 600 MG COMPRIMIDOS RECUBIERTOS CON PELICULA EFG",
@@ -101,6 +112,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Metformina 850mg",
         "grupo": "Metabolismo",
         "atc": "A10BA02",
+        "condition": "diabetes mellitus tipo 2",
+        "symptom": "la diabetes tipo 2",
         "brand": "DIANBEN 850 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
         "generics": [
             "METFORMINA CINFA 850 MG COMPRIMIDOS RECUBIERTOS CON PELICULA EFG",
@@ -112,6 +125,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Sertralina 50mg",
         "grupo": "SNC - Antidepresivos",
         "atc": "N06AB06",
+        "condition": "depresión y trastorno obsesivo-compulsivo",
+        "symptom": "la depresión",
         "brand": "BESITRAN 50 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
         "generics": [
             "SERTRALINA CINFA 50 MG COMPRIMIDOS RECUBIERTOS CON PELICULA EFG",
@@ -123,6 +138,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Simvastatina 20mg",
         "grupo": "Cardiovascular",
         "atc": "C10AA01",
+        "condition": "hipercolesterolemia",
+        "symptom": "el colesterol alto",
         "brand": "ZOCOR 20 MG COMPRIMIDOS RECUBIERTOS CON PELICULA",
         "generics": [
             "SIMVASTATINA CINFA 20 MG COMPRIMIDOS RECUBIERTOS CON PELICULA EFG",
@@ -134,6 +151,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Amlodipino 5mg",
         "grupo": "Cardiovascular",
         "atc": "C08CA01",
+        "condition": "hipertensión arterial",
+        "symptom": "la tensión alta",
         "brand": "NORVASC 5 MG COMPRIMIDOS",
         "generics": [
             "AMLODIPINO CINFA 5 MG COMPRIMIDOS EFG",
@@ -145,6 +164,8 @@ OFFLINE_PAIRS = [
         "principio_activo": "Levotiroxina 100mcg",
         "grupo": "Hormonas tiroideas",
         "atc": "H03AA01",
+        "condition": "hipotiroidismo",
+        "symptom": "el tiroides bajo",
         "brand": "EUTIROX 100 MICROGRAMOS COMPRIMIDOS",
         "generics": [
             "LEVOTIROXINA SANOFI 100 MICROGRAMOS COMPRIMIDOS EFG",

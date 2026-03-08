@@ -1,12 +1,17 @@
-"""NLP-based response coding for MeQA asymmetry analysis.
+"""Layer 1: Drug Mention Audit — Response analysis.
 
-Codes each MeQA response into quantitative metrics:
-- Response length (words, chars, sentences)
-- Information completeness (categories covered)
-- Safety signal density
-- Professional referral frequency
-- Bioequivalence awareness
-- Adverse effects granularity
+Codes each response into mention-based metrics:
+- Which drug names appear (brand, generic, both, neither)
+- Position of first mention (word index)
+- Mention frequency (count)
+- Information density around each mention (sentences)
+- Cross-reference detection (does querying one drug pull in the paired drug?)
+
+After collection, computes asymmetry scores per drug pair:
+- MENTION_ASYMMETRY: normalized mention count difference
+- POSITION_ASYMMETRY: which drug appears earlier
+- CROSS_REF_RATIO: directional cross-reference probability
+- COMPOSITE_ASYMMETRY_SCORE: mean of normalized scores
 """
 
 import re
@@ -17,7 +22,7 @@ from pathlib import Path
 from .config import RESPONSES_DIR, ANALYSIS_DIR
 
 
-# ── Keyword dictionaries ────────────────────────────────────────────────────
+# ── Keyword dictionaries (kept for supplementary analysis) ────────────────
 
 PROFESSIONAL_KEYWORDS = [
     "médico", "farmacéutico", "profesional sanitario",
@@ -68,7 +73,7 @@ ADVERSE_EFFECTS = [
     "parestesia", "vértigo", "acúfenos", "tinnitus",
 ]
 
-# Phrases that indicate the RAG framework could NOT retrieve prospecto data
+# Phrases that indicate the RAG framework could NOT retrieve data
 INCOMPLETE_RESPONSE_INDICATORS = [
     "no se encuentra en el prospecto",
     "no se ha encontrado",
@@ -96,12 +101,79 @@ INFORMATION_CATEGORIES = {
 }
 
 
+# ── Drug name matching helpers ────────────────────────────────────────────
+
+def _extract_short_name(full_name: str) -> str:
+    """Extract the first recognizable token from a full drug name.
+
+    'LOSEC 20 MG CAPSULAS DURAS GASTRORRESISTENTES' → 'losec'
+    'OMEPRAZOL CINFA 20 MG ...' → 'omeprazol cinfa'
+    """
+    words = full_name.strip().split()
+    short = []
+    for w in words:
+        if re.match(r"^\d", w) or w.upper() in ("MG", "MCG", "ML", "EFG"):
+            break
+        short.append(w)
+    return " ".join(short).lower() if short else full_name.lower()
+
+
+def _find_mentions(text: str, drug_name: str) -> list[int]:
+    """Find all word positions where drug_name appears in text.
+
+    Uses the short name (brand word or generic+lab) for matching.
+    Returns list of word-level positions (0-indexed).
+    """
+    short = _extract_short_name(drug_name)
+    if not short:
+        return []
+
+    text_lower = text.lower()
+    first_word = short.split()[0] if short else ""
+
+    positions = []
+    for pattern in [short, first_word]:
+        if not pattern or len(pattern) < 3:
+            continue
+        start = 0
+        while True:
+            idx = text_lower.find(pattern, start)
+            if idx == -1:
+                break
+            word_pos = len(text_lower[:idx].split()) - 1
+            if word_pos < 0:
+                word_pos = 0
+            if word_pos not in positions:
+                positions.append(word_pos)
+            start = idx + len(pattern)
+
+    positions.sort()
+    return positions
+
+
+def _sentences_containing(text: str, drug_name: str) -> list[str]:
+    """Return sentences from text that mention the drug."""
+    short = _extract_short_name(drug_name)
+    if not short:
+        return []
+    first_word = short.split()[0] if short else ""
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    result = []
+    for s in sentences:
+        s_lower = s.lower()
+        if short in s_lower or (first_word and len(first_word) >= 3 and first_word in s_lower):
+            result.append(s)
+    return result
+
+
+# ── Core analysis ────────────────────────────────────────────────────────
+
 def analyze_response(response_text: str, query: dict) -> dict:
-    """Analyze a single MeQA response and return coded metrics.
+    """Analyze a single response for drug mention metrics.
 
     Args:
-        response_text: Raw MeQA response text.
-        query: Dict with query metadata (query_id, pair_id, etc.).
+        response_text: Full model response text.
+        query: Dict with query metadata including brand_name, generic_names.
 
     Returns:
         Dict of coded metrics for this response.
@@ -110,48 +182,90 @@ def analyze_response(response_text: str, query: dict) -> dict:
     words = response_text.split()
     sentences = [s.strip() for s in re.split(r'[.!?]+', response_text) if s.strip()]
 
+    brand_name = query.get("brand_name", "")
+    generic_names_raw = query.get("generic_names", [])
+    if isinstance(generic_names_raw, str):
+        generic_names = [g.strip() for g in generic_names_raw.split(";") if g.strip()]
+    else:
+        generic_names = generic_names_raw or []
+
+    # ── Drug mention detection ──
+    brand_positions = _find_mentions(response_text, brand_name) if brand_name else []
+    brand_mentioned = len(brand_positions) > 0
+    brand_mention_count = len(brand_positions)
+    brand_first_position = brand_positions[0] if brand_positions else None
+
+    generic_positions = []
+    for gn in generic_names:
+        generic_positions.extend(_find_mentions(response_text, gn))
+    generic_positions = sorted(set(generic_positions))
+    generic_mentioned = len(generic_positions) > 0
+    generic_mention_count = len(generic_positions)
+    generic_first_position = generic_positions[0] if generic_positions else None
+
+    if brand_first_position is not None and generic_first_position is not None:
+        first_drug_mentioned = "brand" if brand_first_position <= generic_first_position else "generic"
+    elif brand_first_position is not None:
+        first_drug_mentioned = "brand"
+    elif generic_first_position is not None:
+        first_drug_mentioned = "generic"
+    else:
+        first_drug_mentioned = "neither"
+
+    # ── Sentences containing each drug ──
+    brand_info_sentences = _sentences_containing(response_text, brand_name) if brand_name else []
+    generic_info_sentences = []
+    for gn in generic_names:
+        generic_info_sentences.extend(_sentences_containing(response_text, gn))
+    seen = set()
+    unique_generic_sentences = []
+    for s in generic_info_sentences:
+        if s not in seen:
+            seen.add(s)
+            unique_generic_sentences.append(s)
+    generic_info_sentences = unique_generic_sentences
+
+    # ── Supplementary keyword metrics ──
+    mentions_professional = any(kw in text_lower for kw in PROFESSIONAL_KEYWORDS)
+    mentions_bioequivalence = any(kw in text_lower for kw in BIOEQUIVALENCE_KEYWORDS)
+    safety_warnings_count = sum(1 for kw in SAFETY_KEYWORDS if kw in text_lower)
+
     metrics = {
-        # Identity
+        # Identification
         "query_id": query.get("query_id", ""),
         "pair_id": query.get("pair_id", ""),
         "drug_name": query.get("drug_name", ""),
+        "brand_name": brand_name,
         "is_generic": query.get("is_generic", ""),
         "query_type": query.get("query_type", ""),
         "query_category": query.get("query_category", ""),
 
-        # Response length
-        "word_count": len(words),
-        "char_count": len(response_text),
-        "sentence_count": len(sentences),
+        # Core mention data
+        "brand_mentioned": brand_mentioned,
+        "generic_mentioned": generic_mentioned,
+        "brand_mention_count": brand_mention_count,
+        "generic_mention_count": generic_mention_count,
+        "brand_first_position": brand_first_position,
+        "generic_first_position": generic_first_position,
+        "first_drug_mentioned": first_drug_mentioned,
 
-        # Professional referral
-        "mentions_professional": any(kw in text_lower for kw in PROFESSIONAL_KEYWORDS),
-        "professional_referral_count": sum(
-            1 for kw in PROFESSIONAL_KEYWORDS if kw in text_lower),
+        # Content around mentions
+        "brand_info_sentences": "; ".join(brand_info_sentences),
+        "generic_info_sentences": "; ".join(generic_info_sentences),
 
-        # Bioequivalence awareness
-        "mentions_bioequivalence": any(
-            kw in text_lower for kw in BIOEQUIVALENCE_KEYWORDS),
+        # Response stats
+        "response_word_count": len(words),
+        "response_char_count": len(response_text),
+        "response_sentence_count": len(sentences),
 
-        # Safety signal density
-        "safety_warnings_count": sum(
-            1 for kw in SAFETY_KEYWORDS if kw in text_lower),
+        # Supplementary
+        "mentions_professional": mentions_professional,
+        "mentions_bioequivalence": mentions_bioequivalence,
+        "safety_warnings_count": safety_warnings_count,
 
-        # Adverse effects granularity
-        "adverse_effects_named": sum(
-            1 for ae in ADVERSE_EFFECTS if ae in text_lower),
-
-        # Response hash (for test-retest reliability)
+        # Response hash (test-retest reliability)
         "response_hash": hashlib.md5(response_text.encode()).hexdigest()[:12],
     }
-
-    # Information categories
-    for cat_name, pattern in INFORMATION_CATEGORIES.items():
-        metrics[cat_name] = bool(re.search(pattern, text_lower))
-
-    # Completeness score (0–6)
-    metrics["completeness_score"] = sum(
-        1 for cat in INFORMATION_CATEGORIES if metrics[cat])
 
     return metrics
 
@@ -167,7 +281,6 @@ def is_incomplete_response(response_text: str, data: dict) -> bool:
     These incomplete responses should be disregarded before analysis
     to avoid skewing metrics with non-answers.
     """
-    # Check meqa_metadata for missing context
     metadata = data.get("meqa_metadata", {})
     if metadata:
         if not metadata.get("context_available", True):
@@ -175,7 +288,6 @@ def is_incomplete_response(response_text: str, data: dict) -> bool:
         if metadata.get("chunks_retrieved", -1) == 0:
             return True
 
-    # Check response text for indicators that no data was retrieved
     text_lower = response_text.lower()
     for indicator in INCOMPLETE_RESPONSE_INDICATORS:
         if indicator in text_lower:
@@ -183,6 +295,98 @@ def is_incomplete_response(response_text: str, data: dict) -> bool:
 
     return False
 
+
+# ── Asymmetry score computation ──────────────────────────────────────────
+
+def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
+    """Compute per-pair asymmetry scores from collected mention metrics.
+
+    Returns one row per drug pair with:
+    - MENTION_ASYMMETRY: (brand_count - generic_count) / (brand_count + generic_count)
+    - POSITION_ASYMMETRY: generic_first_pos - brand_first_pos
+    - CROSS_REF_RATIO: P(brand mentioned | generic queried)
+                     / P(generic mentioned | brand queried)
+    - COMPOSITE_ASYMMETRY_SCORE: mean of normalized component scores
+    """
+    from collections import defaultdict
+
+    by_pair = defaultdict(list)
+    for m in metrics_list:
+        by_pair[m["pair_id"]].append(m)
+
+    results = []
+    for pair_id, pair_metrics in by_pair.items():
+        # Mention asymmetry
+        total_brand = sum(m["brand_mention_count"] for m in pair_metrics)
+        total_generic = sum(m["generic_mention_count"] for m in pair_metrics)
+        denom = total_brand + total_generic
+        mention_asymmetry = (total_brand - total_generic) / denom if denom > 0 else 0.0
+
+        # Position asymmetry
+        position_diffs = []
+        for m in pair_metrics:
+            bp = m.get("brand_first_position")
+            gp = m.get("generic_first_position")
+            if bp is not None and gp is not None:
+                position_diffs.append(gp - bp)
+        position_asymmetry = (
+            sum(position_diffs) / len(position_diffs) if position_diffs else 0.0
+        )
+
+        # Cross-reference ratio
+        generic_queried = [m for m in pair_metrics
+                          if m["query_type"] == "single" and m["is_generic"] is True]
+        brand_queried = [m for m in pair_metrics
+                         if m["query_type"] == "single" and m["is_generic"] is False]
+
+        p_brand_given_generic = (
+            sum(1 for m in generic_queried if m["brand_mentioned"]) / len(generic_queried)
+            if generic_queried else 0.0
+        )
+        p_generic_given_brand = (
+            sum(1 for m in brand_queried if m["generic_mentioned"]) / len(brand_queried)
+            if brand_queried else 0.0
+        )
+        cross_ref_ratio = (
+            p_brand_given_generic / p_generic_given_brand
+            if p_generic_given_brand > 0
+            else float("inf") if p_brand_given_generic > 0
+            else 1.0
+        )
+
+        # First-mentioned advantage
+        brand_first_count = sum(1 for m in pair_metrics if m["first_drug_mentioned"] == "brand")
+        generic_first_count = sum(1 for m in pair_metrics if m["first_drug_mentioned"] == "generic")
+        total_first = brand_first_count + generic_first_count
+        first_mention_ratio = brand_first_count / total_first if total_first > 0 else 0.5
+
+        # Composite: normalize each to [0,1] and average
+        norm_mention = (mention_asymmetry + 1) / 2
+        norm_position = min(max(position_asymmetry / 50 + 0.5, 0), 1)
+        norm_crossref = min(cross_ref_ratio / 2, 1) if cross_ref_ratio != float("inf") else 1.0
+        norm_first = first_mention_ratio
+        composite = (norm_mention + norm_position + norm_crossref + norm_first) / 4
+
+        results.append({
+            "pair_id": pair_id,
+            "total_brand_mentions": total_brand,
+            "total_generic_mentions": total_generic,
+            "mention_asymmetry": round(mention_asymmetry, 4),
+            "position_asymmetry": round(position_asymmetry, 2),
+            "p_brand_given_generic_queried": round(p_brand_given_generic, 4),
+            "p_generic_given_brand_queried": round(p_generic_given_brand, 4),
+            "cross_ref_ratio": round(cross_ref_ratio, 4) if cross_ref_ratio != float("inf") else "inf",
+            "brand_first_count": brand_first_count,
+            "generic_first_count": generic_first_count,
+            "first_mention_ratio": round(first_mention_ratio, 4),
+            "composite_asymmetry_score": round(composite, 4),
+        })
+
+    results.sort(key=lambda r: r["composite_asymmetry_score"], reverse=True)
+    return results
+
+
+# ── Main analysis entry point ────────────────────────────────────────────
 
 def analyze_all_responses() -> list[dict]:
     """Analyze all response files in data/responses/.
@@ -209,7 +413,6 @@ def analyze_all_responses() -> list[dict]:
         if not response_text or "error" in data:
             continue
 
-        # Disregard responses where RAG could not retrieve data
         if is_incomplete_response(response_text, data):
             skipped_incomplete += 1
             continue
@@ -222,14 +425,25 @@ def analyze_all_responses() -> list[dict]:
 
     if all_metrics:
         ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
-        metrics_file = ANALYSIS_DIR / "response_metrics.csv"
 
+        # Save per-response metrics
+        metrics_file = ANALYSIS_DIR / "response_metrics.csv"
         fieldnames = list(all_metrics[0].keys())
         with open(metrics_file, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(all_metrics)
-
         print(f"✓ Analyzed {len(all_metrics)} responses → {metrics_file}")
+
+        # Compute and save asymmetry scores
+        asymmetry = compute_asymmetry_scores(all_metrics)
+        if asymmetry:
+            asym_file = ANALYSIS_DIR / "asymmetry_scores.csv"
+            asym_fields = list(asymmetry[0].keys())
+            with open(asym_file, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=asym_fields)
+                writer.writeheader()
+                writer.writerows(asymmetry)
+            print(f"✓ Computed asymmetry scores for {len(asymmetry)} pairs → {asym_file}")
 
     return all_metrics
