@@ -591,31 +591,16 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             sum(position_diffs) / len(position_diffs) if position_diffs else 0.0
         )
 
-        # Cross-reference: in open queries, does brand or generic-product appear?
-        open_types = ("condition", "drug_class")
-        open_queries = [m for m in pair_metrics if m["query_type"] in open_types]
-        brand_in_open = (
-            sum(1 for m in open_queries if m["brand_mentioned"]) / len(open_queries)
-            if open_queries else 0.0
-        )
-        generic_in_open = (
-            sum(1 for m in open_queries if m["generic_mentioned"]) / len(open_queries)
-            if open_queries else 0.0
-        )
-
-        # Cross-reference: in brand queries, does INN/generic get mentioned?
-        brand_queries = [m for m in pair_metrics if m["query_type"] == "brand"]
-        inn_in_brand = (
-            sum(1 for m in brand_queries if m.get("inn_mentioned", False)) / len(brand_queries)
-            if brand_queries else 0.0
-        )
-
-        # Cross-reference: in INN queries, does brand get mentioned?
-        inn_queries = [m for m in pair_metrics if m["query_type"] == "inn"]
-        brand_in_inn = (
-            sum(1 for m in inn_queries if m["brand_mentioned"]) / len(inn_queries)
-            if inn_queries else 0.0
-        )
+        # Per-type breakdown (all queries are open now)
+        by_type = {}
+        for m in pair_metrics:
+            qt = m["query_type"]
+            if qt not in by_type:
+                by_type[qt] = {"brand": 0, "generic": 0, "inn": 0, "n": 0}
+            by_type[qt]["brand"] += m["brand_mention_count"]
+            by_type[qt]["generic"] += m["generic_mention_count"]
+            by_type[qt]["inn"] += m.get("inn_mention_count", 0)
+            by_type[qt]["n"] += 1
 
         # First-mentioned advantage (brand vs generic-product, ignoring INN-only)
         brand_first_count = sum(1 for m in pair_metrics if m["first_drug_mentioned"] == "brand")
@@ -630,7 +615,7 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
         norm_first = first_mention_ratio
         composite = (norm_mention + norm_position + norm_brand_rate + norm_first) / 4
 
-        results.append({
+        row = {
             "pair_id": pair_id,
             "grupo_terapeutico": grupo,
             "drug_class": drug_class,
@@ -643,15 +628,19 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             "inn_mention_rate": round(inn_mention_rate, 4),
             "mention_asymmetry": round(mention_asymmetry, 4),
             "position_asymmetry": round(position_asymmetry, 2),
-            "brand_in_open_queries": round(brand_in_open, 4),
-            "generic_in_open_queries": round(generic_in_open, 4),
-            "brand_in_inn_queries": round(brand_in_inn, 4),
-            "inn_in_brand_queries": round(inn_in_brand, 4),
             "brand_first_count": brand_first_count,
             "generic_first_count": generic_first_count,
             "first_mention_ratio": round(first_mention_ratio, 4),
             "composite_asymmetry_score": round(composite, 4),
-        })
+        }
+
+        # Add per-type breakdowns
+        for qt in sorted(by_type):
+            row[f"{qt}_brand"] = by_type[qt]["brand"]
+            row[f"{qt}_generic"] = by_type[qt]["generic"]
+            row[f"{qt}_inn"] = by_type[qt]["inn"]
+
+        results.append(row)
 
     results.sort(key=lambda r: r["composite_asymmetry_score"], reverse=True)
     return results
@@ -706,11 +695,10 @@ def compute_therapeutic_area_summary(metrics_list: list[dict]) -> list[dict]:
         }
 
         # Add per-type counts
-        for qt in ["condition", "drug_class", "inn", "brand", "recommend", "access"]:
-            if qt in by_type:
-                row[f"{qt}_brand"] = by_type[qt]["brand"]
-                row[f"{qt}_generic"] = by_type[qt]["generic"]
-                row[f"{qt}_n"] = by_type[qt]["n"]
+        for qt in sorted(by_type):
+            row[f"{qt}_brand"] = by_type[qt]["brand"]
+            row[f"{qt}_generic"] = by_type[qt]["generic"]
+            row[f"{qt}_n"] = by_type[qt]["n"]
 
         results.append(row)
 
