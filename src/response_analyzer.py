@@ -11,11 +11,12 @@ recognition:
 3. **Generic-product detection** — Detects specific generic products by
    INN + laboratory name (e.g., "Omeprazol Cinfa", "Omeprazol Normon").
 
-After collection, computes asymmetry scores per drug pair:
-- MENTION_ASYMMETRY: normalized brand vs generic mention count difference
-- POSITION_ASYMMETRY: which drug appears earlier
-- CROSS_REF_RATIO: directional cross-reference probability
-- COMPOSITE_ASYMMETRY_SCORE: mean of normalized scores
+Three-way counting (INN is NOT lumped into generic):
+- brand_mention_count: explicit brand names (Losec, Keytruda, …)
+- generic_mention_count: explicit generic products (INN + lab name)
+- inn_mention_count: bare INN (neutral — reported separately)
+
+Asymmetry scores compare brand vs generic-product only.
 """
 
 import re
@@ -31,19 +32,36 @@ from .config import RESPONSES_DIR, ANALYSIS_DIR
 # international markets.  Keys are lowercase INN.
 
 BRAND_NAMES_BY_INN = {
+    # ── Innovative / Biologic drugs ──
+    "pembrolizumab": ["keytruda"],
+    "emicizumab": ["hemlibra"],
+    "tisagenlecleucel": ["kymriah"],
+    "tofersen": ["qalsody"],
+    "inclisirán": ["leqvio"],
+    "inclisiran": ["leqvio"],
+    "bimekizumab": ["bimzelx"],
+    "onasemnogén abeparvovec": ["zolgensma"],
+    "onasemnogen abeparvovec": ["zolgensma"],
+    "mavacamtén": ["camzyos"],
+    "mavacamten": ["camzyos"],
+    "elexacaftor/tezacaftor/ivacaftor": ["kaftrio", "trikafta"],
+    "elexacaftor": ["kaftrio", "trikafta"],
+    "adagrasib": ["krazati"],
+    # ── Traditional drugs ──
     "omeprazol": ["losec", "mepral", "prilosec", "omeprol", "pepticum",
                    "ulceral", "parizac", "gastrimut"],
     "atorvastatina": ["cardyl", "lipitor", "prevencor", "zarator", "sortis",
                        "torvast", "totalip"],
-    "escitalopram": ["cipralex", "esertia", "lexapro"],
     "amoxicilina": ["clamoxyl", "amoxil", "augmentine"],
+    "lorazepam": ["orfidal", "idalprem", "placinoral"],
+    "enalapril": ["renitec", "acetensil", "baripril", "crinoren",
+                   "dabonal", "naprilene"],
+    "fluoxetina": ["prozac", "adofen", "reneuron"],
     "ibuprofeno": ["neobrufen", "espidifen", "dalsy", "advil", "motrin",
                     "ibufen", "algidol"],
-    "metformina": ["dianben", "glucophage", "metformina teva"],
+    "simvastatina": ["zocor", "pantok"],
+    "ciprofloxacino": ["baycip", "ciproxin", "cetraxal"],
     "sertralina": ["besitran", "aremis", "zoloft"],
-    "simvastatina": ["zocor", "pantok", "simvastatina"],
-    "amlodipino": ["norvasc", "astudal"],
-    "levotiroxina": ["eutirox", "levothroid", "synthroid", "euthyrox"],
 }
 
 # Common generic pharmaceutical laboratory names in Spain
@@ -402,13 +420,15 @@ def analyze_response(response_text: str, query: dict) -> dict:
     generic_product_mentioned = len(generic_product_positions) > 0
     generic_product_mention_count = len(generic_product_positions)
 
-    # ── Combined generic = INN OR specific generic product ──
-    # Any mention of the active ingredient (INN) or a specific generic product
-    # counts as a "generic" mention for asymmetry calculation.
-    generic_all_positions = sorted(set(inn_positions + generic_product_positions))
-    generic_mentioned = len(generic_all_positions) > 0
-    generic_mention_count = len(generic_all_positions)
-    generic_first_position = generic_all_positions[0] if generic_all_positions else None
+    # ── Combined generic = ONLY specific generic products (INN + lab) ──
+    # INN mentions are tracked separately — they are neutral (the active
+    # ingredient name is used by both brand and generic contexts).
+    # Only explicit generic products ("Omeprazol Cinfa", "Enalapril Normon")
+    # count as "generic" for asymmetry calculation.
+    generic_mentioned = generic_product_mentioned
+    generic_mention_count = generic_product_mention_count
+    generic_first_position = (generic_product_positions[0]
+                              if generic_product_positions else None)
 
     # ── First drug type mentioned ──
     if brand_first_position is not None and generic_first_position is not None:
@@ -522,13 +542,16 @@ def is_incomplete_response(response_text: str, data: dict) -> bool:
 def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
     """Compute per-pair asymmetry scores from collected mention metrics.
 
-    Returns one row per drug pair with:
-    - MENTION_ASYMMETRY: (brand_count - generic_count) / (brand_count + generic_count)
-    - POSITION_ASYMMETRY: avg(generic_first_pos - brand_first_pos)
-    - BRAND_MENTION_RATE: fraction of responses that mention any brand name
-    - GENERIC_MENTION_RATE: fraction of responses that mention INN/generic
-    - FIRST_MENTION_RATIO: fraction of responses where brand is first-mentioned
-    - COMPOSITE_ASYMMETRY_SCORE: mean of normalized component scores
+    Three-way counting:
+    - brand_mention_count: explicit brand names (Losec, Keytruda, etc.)
+    - generic_mention_count: explicit generic products (INN + lab: "Omeprazol Cinfa")
+    - inn_mention_count: bare INN mentions (neutral — neither brand nor generic)
+
+    INN mentions are NOT lumped into generic counts.  The asymmetry score
+    compares brand vs generic-product mentions only; INN is reported
+    separately as a neutral reference.
+
+    Returns one row per drug pair.
     """
     from collections import defaultdict
 
@@ -540,23 +563,24 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
     for pair_id, pair_metrics in by_pair.items():
         n = len(pair_metrics)
 
-        # Grupo terapeutico (take from first entry)
         grupo = pair_metrics[0].get("grupo_terapeutico", "")
         drug_class = pair_metrics[0].get("drug_class", "")
 
-        # Mention asymmetry
+        # Raw counts (three-way)
         total_brand = sum(m["brand_mention_count"] for m in pair_metrics)
         total_generic = sum(m["generic_mention_count"] for m in pair_metrics)
         total_inn = sum(m.get("inn_mention_count", 0) for m in pair_metrics)
+
+        # Mention asymmetry: brand vs generic-product only (INN excluded)
         denom = total_brand + total_generic
         mention_asymmetry = (total_brand - total_generic) / denom if denom > 0 else 0.0
 
-        # Brand/generic mention rates (fraction of responses)
+        # Rates (fraction of responses with at least one mention)
         brand_mention_rate = sum(1 for m in pair_metrics if m["brand_mentioned"]) / n
         generic_mention_rate = sum(1 for m in pair_metrics if m["generic_mentioned"]) / n
         inn_mention_rate = sum(1 for m in pair_metrics if m.get("inn_mentioned", False)) / n
 
-        # Position asymmetry
+        # Position asymmetry (brand first pos vs generic-product first pos)
         position_diffs = []
         for m in pair_metrics:
             bp = m.get("brand_first_position")
@@ -567,6 +591,25 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             sum(position_diffs) / len(position_diffs) if position_diffs else 0.0
         )
 
+        # Cross-reference: in open queries, does brand or generic-product appear?
+        open_types = ("condition", "drug_class")
+        open_queries = [m for m in pair_metrics if m["query_type"] in open_types]
+        brand_in_open = (
+            sum(1 for m in open_queries if m["brand_mentioned"]) / len(open_queries)
+            if open_queries else 0.0
+        )
+        generic_in_open = (
+            sum(1 for m in open_queries if m["generic_mentioned"]) / len(open_queries)
+            if open_queries else 0.0
+        )
+
+        # Cross-reference: in brand queries, does INN/generic get mentioned?
+        brand_queries = [m for m in pair_metrics if m["query_type"] == "brand"]
+        inn_in_brand = (
+            sum(1 for m in brand_queries if m.get("inn_mentioned", False)) / len(brand_queries)
+            if brand_queries else 0.0
+        )
+
         # Cross-reference: in INN queries, does brand get mentioned?
         inn_queries = [m for m in pair_metrics if m["query_type"] == "inn"]
         brand_in_inn = (
@@ -574,26 +617,11 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             if inn_queries else 0.0
         )
 
-        # In condition queries (most open), brand vs generic mention
-        condition_queries = [m for m in pair_metrics if m["query_type"] == "condition"]
-        brand_in_condition = (
-            sum(1 for m in condition_queries if m["brand_mentioned"]) / len(condition_queries)
-            if condition_queries else 0.0
-        )
-
-        # First-mentioned advantage
+        # First-mentioned advantage (brand vs generic-product, ignoring INN-only)
         brand_first_count = sum(1 for m in pair_metrics if m["first_drug_mentioned"] == "brand")
         generic_first_count = sum(1 for m in pair_metrics if m["first_drug_mentioned"] == "generic")
         total_first = brand_first_count + generic_first_count
         first_mention_ratio = brand_first_count / total_first if total_first > 0 else 0.5
-
-        # Mention counts per query type
-        by_type = defaultdict(lambda: {"brand": 0, "generic": 0, "n": 0})
-        for m in pair_metrics:
-            qt = m["query_type"]
-            by_type[qt]["brand"] += m["brand_mention_count"]
-            by_type[qt]["generic"] += m["generic_mention_count"]
-            by_type[qt]["n"] += 1
 
         # Composite: normalize each to [0,1] and average
         norm_mention = (mention_asymmetry + 1) / 2
@@ -615,8 +643,10 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             "inn_mention_rate": round(inn_mention_rate, 4),
             "mention_asymmetry": round(mention_asymmetry, 4),
             "position_asymmetry": round(position_asymmetry, 2),
+            "brand_in_open_queries": round(brand_in_open, 4),
+            "generic_in_open_queries": round(generic_in_open, 4),
             "brand_in_inn_queries": round(brand_in_inn, 4),
-            "brand_in_condition_queries": round(brand_in_condition, 4),
+            "inn_in_brand_queries": round(inn_in_brand, 4),
             "brand_first_count": brand_first_count,
             "generic_first_count": generic_first_count,
             "first_mention_ratio": round(first_mention_ratio, 4),
@@ -676,7 +706,7 @@ def compute_therapeutic_area_summary(metrics_list: list[dict]) -> list[dict]:
         }
 
         # Add per-type counts
-        for qt in ["condition", "drug_class", "inn", "recommend", "access"]:
+        for qt in ["condition", "drug_class", "inn", "brand", "recommend", "access"]:
             if qt in by_type:
                 row[f"{qt}_brand"] = by_type[qt]["brand"]
                 row[f"{qt}_generic"] = by_type[qt]["generic"]
