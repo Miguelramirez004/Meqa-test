@@ -123,7 +123,7 @@ if page == "1. Drug Pairs":
             "Brand": p["brand"].split(" ")[0],
             "Generics": len(p["generics"]),
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ── Page 2: Generate Queries ─────────────────────────────────────────────────
@@ -140,7 +140,7 @@ elif page == "2. Generate Queries":
     existing_df = load_queries_df()
     if existing_df is not None:
         st.success(f"Query battery already exists: **{len(existing_df)} queries**")
-        st.dataframe(existing_df.head(20), use_container_width=True, hide_index=True)
+        st.dataframe(existing_df.head(20), width="stretch", hide_index=True)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -187,7 +187,7 @@ elif page == "3. Download Prospectos":
     if existing:
         st.info(f"**{len(existing)}** prospectos already downloaded.")
         names = [f.stem for f in sorted(existing)]
-        st.dataframe(pd.DataFrame({"Prospecto": names}), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame({"Prospecto": names}), width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -485,7 +485,7 @@ elif page == "4. Collect Responses":
     if uploaded is not None:
         try:
             resp_df = pd.read_csv(uploaded)
-            st.dataframe(resp_df.head(10), use_container_width=True, hide_index=True)
+            st.dataframe(resp_df.head(10), width="stretch", hide_index=True)
 
             if "query_id" not in resp_df.columns or "response_text" not in resp_df.columns:
                 st.error("CSV must contain `query_id` and `response_text` columns.")
@@ -587,7 +587,7 @@ elif page == "4. Collect Responses":
                 "Words": len(text.split()) if text else 0,
                 "Preview": text[:100] + "..." if len(text) > 100 else text,
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
         if resp_count > 20:
             st.caption(f"Showing first 20 of {resp_count} responses.")
 
@@ -629,7 +629,7 @@ elif page == "5. Analyze Responses":
     if metrics_df is not None:
         st.markdown("---")
         st.subheader("Coded Metrics")
-        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+        st.dataframe(metrics_df, width="stretch", hide_index=True)
 
         # Key stats
         st.markdown("---")
@@ -715,7 +715,7 @@ elif page == "5. Analyze Responses":
         mention_by_type = metrics_df.groupby("query_type").agg(**agg_dict).reset_index()
         mention_by_type["brand_pct"] = (mention_by_type["brand_pct"] * 100).round(0).astype(int).astype(str) + "%"
         mention_by_type["generic_pct"] = (mention_by_type["generic_pct"] * 100).round(0).astype(int).astype(str) + "%"
-        st.dataframe(mention_by_type, use_container_width=True, hide_index=True)
+        st.dataframe(mention_by_type, width="stretch", hide_index=True)
 
         # Asymmetry scores
         asym_file = ANALYSIS_DIR / "asymmetry_scores.csv"
@@ -723,7 +723,7 @@ elif page == "5. Analyze Responses":
             st.markdown("---")
             st.subheader("Asymmetry Scores (per drug pair)")
             asym_df = pd.read_csv(asym_file)
-            st.dataframe(asym_df, use_container_width=True, hide_index=True)
+            st.dataframe(asym_df, width="stretch", hide_index=True)
 
             if not asym_df.empty:
                 st.bar_chart(asym_df.set_index("pair_id")["composite_asymmetry_score"])
@@ -774,7 +774,7 @@ elif page == "6. Statistical Analysis":
 
             if rows:
                 agg = pd.DataFrame(rows)
-                st.dataframe(agg, use_container_width=True, hide_index=True)
+                st.dataframe(agg, width="stretch", hide_index=True)
 
                 if len(agg) >= 5:
                     w, p = stats.wilcoxon(agg["Brand Mentions"].values, agg["Generic Mentions"].values)
@@ -867,7 +867,7 @@ elif page == "6. Statistical Analysis":
             asym_file = ANALYSIS_DIR / "asymmetry_scores.csv"
             if asym_file.exists():
                 asym_df = pd.read_csv(asym_file)
-                st.dataframe(asym_df, use_container_width=True, hide_index=True)
+                st.dataframe(asym_df, width="stretch", hide_index=True)
 
                 cas = asym_df["composite_asymmetry_score"].values
                 col1, col2, col3 = st.columns(3)
@@ -906,7 +906,7 @@ elif page == "6. Statistical Analysis":
                             "Std": f"{sub[col_name].std():.2f}",
                             "Median": f"{sub[col_name].median():.1f}",
                         })
-                st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(stats_rows), width="stretch", hide_index=True)
 
             summary_data = metrics_df.groupby("query_type").agg({
                 "brand_mentioned": ["sum", "mean"],

@@ -11,13 +11,13 @@ the model "knows" on its own.
 
 Supported models:
   - OpenAI: gpt-4o, gpt-4o-mini, gpt-3.5-turbo
-  - Google: gemini-2.0-flash, gemini-2.0-flash-lite
+  - Google: gemini-2.5-flash, gemini-2.5-flash-lite
   - Perplexity: llama-3.1-sonar-small-128k-online, etc.
 
-Notes on Gemini:
-  - gemini-1.5-* models are deprecated (404)
-  - gemini-2.0-flash is the current stable model
-  - gemini-2.0-flash-lite has higher free-tier rate limits
+Notes on Gemini (as of March 2026):
+  - gemini-1.5-* and gemini-2.0-* are retired (404 for new users)
+  - gemini-2.5-flash is the current stable model
+  - gemini-2.5-flash-lite is the cheaper/faster alternative
 """
 
 import json
@@ -67,8 +67,8 @@ PROVIDER_PREFIXES = {
 
 PROVIDER_MODELS = {
     "openai": ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
-    # gemini-1.5-* deprecated as of 2026 (returns 404)
-    "gemini": ["gemini-2.0-flash", "gemini-2.0-flash-lite"],
+    # gemini-1.5/2.0 retired — 404 for new users as of 2026
+    "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
     "perplexity": [
         "llama-3.1-sonar-small-128k-online",
         "llama-3.1-sonar-large-128k-online",
