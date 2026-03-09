@@ -811,11 +811,16 @@ def collect_all_responses(
             )
 
     # ── LLM client ──
-    llm = ChatOpenAI(
+    # Gemini 2.5+ thinking models need a high max_completion_tokens to avoid
+    # truncation (thinking tokens consume the output budget).
+    llm_kwargs: dict = dict(
         model=model,
         temperature=0.3,
         openai_api_key=api_key,
     )
+    if "gemini-2.5" in model and "lite" not in model:
+        llm_kwargs["max_completion_tokens"] = 8192
+    llm = ChatOpenAI(**llm_kwargs)
 
     # ── Process each query through the 3 MeQA blocks ──
     collected = []

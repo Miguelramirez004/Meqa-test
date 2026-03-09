@@ -121,9 +121,13 @@ def query_commercial_model(
     Retries once with exponential backoff on rate-limit errors (429/409).
     Returns empty string on unrecoverable errors (logged with full message).
     """
+    # Gemini 2.5+ thinking models consume output budget with reasoning tokens,
+    # causing truncated responses unless max_completion_tokens is set high.
+    is_thinking_model = "gemini-2.5" in model and "lite" not in model
+
     for attempt in range(2):
         try:
-            response = client.chat.completions.create(
+            kwargs: dict = dict(
                 model=model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
@@ -131,6 +135,9 @@ def query_commercial_model(
                 ],
                 temperature=temperature,
             )
+            if is_thinking_model:
+                kwargs["max_completion_tokens"] = 8192
+            response = client.chat.completions.create(**kwargs)
             return response.choices[0].message.content.strip()
         except Exception as e:
             err_str = str(e)
