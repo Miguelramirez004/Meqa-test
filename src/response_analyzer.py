@@ -440,6 +440,8 @@ def analyze_response(response_text: str, query: dict) -> dict:
         "drug_name": query.get("drug_name", ""),
         "brand_name": brand_name,
         "principio_activo": principio_activo,
+        "grupo_terapeutico": query.get("grupo_terapeutico", ""),
+        "drug_class": query.get("drug_class", ""),
         "is_generic": query.get("is_generic", ""),
         "query_type": query.get("query_type", ""),
         "query_category": query.get("query_category", ""),
@@ -522,9 +524,10 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
 
     Returns one row per drug pair with:
     - MENTION_ASYMMETRY: (brand_count - generic_count) / (brand_count + generic_count)
-    - POSITION_ASYMMETRY: generic_first_pos - brand_first_pos
-    - CROSS_REF_RATIO: P(brand mentioned | generic queried)
-                     / P(generic mentioned | brand queried)
+    - POSITION_ASYMMETRY: avg(generic_first_pos - brand_first_pos)
+    - BRAND_MENTION_RATE: fraction of responses that mention any brand name
+    - GENERIC_MENTION_RATE: fraction of responses that mention INN/generic
+    - FIRST_MENTION_RATIO: fraction of responses where brand is first-mentioned
     - COMPOSITE_ASYMMETRY_SCORE: mean of normalized component scores
     """
     from collections import defaultdict
@@ -535,11 +538,23 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
 
     results = []
     for pair_id, pair_metrics in by_pair.items():
+        n = len(pair_metrics)
+
+        # Grupo terapeutico (take from first entry)
+        grupo = pair_metrics[0].get("grupo_terapeutico", "")
+        drug_class = pair_metrics[0].get("drug_class", "")
+
         # Mention asymmetry
         total_brand = sum(m["brand_mention_count"] for m in pair_metrics)
         total_generic = sum(m["generic_mention_count"] for m in pair_metrics)
+        total_inn = sum(m.get("inn_mention_count", 0) for m in pair_metrics)
         denom = total_brand + total_generic
         mention_asymmetry = (total_brand - total_generic) / denom if denom > 0 else 0.0
+
+        # Brand/generic mention rates (fraction of responses)
+        brand_mention_rate = sum(1 for m in pair_metrics if m["brand_mentioned"]) / n
+        generic_mention_rate = sum(1 for m in pair_metrics if m["generic_mentioned"]) / n
+        inn_mention_rate = sum(1 for m in pair_metrics if m.get("inn_mentioned", False)) / n
 
         # Position asymmetry
         position_diffs = []
@@ -552,25 +567,18 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             sum(position_diffs) / len(position_diffs) if position_diffs else 0.0
         )
 
-        # Cross-reference ratio
-        generic_queried = [m for m in pair_metrics
-                          if m["query_type"] == "single" and m["is_generic"] is True]
-        brand_queried = [m for m in pair_metrics
-                         if m["query_type"] == "single" and m["is_generic"] is False]
+        # Cross-reference: in INN queries, does brand get mentioned?
+        inn_queries = [m for m in pair_metrics if m["query_type"] == "inn"]
+        brand_in_inn = (
+            sum(1 for m in inn_queries if m["brand_mentioned"]) / len(inn_queries)
+            if inn_queries else 0.0
+        )
 
-        p_brand_given_generic = (
-            sum(1 for m in generic_queried if m["brand_mentioned"]) / len(generic_queried)
-            if generic_queried else 0.0
-        )
-        p_generic_given_brand = (
-            sum(1 for m in brand_queried if m["generic_mentioned"]) / len(brand_queried)
-            if brand_queried else 0.0
-        )
-        cross_ref_ratio = (
-            p_brand_given_generic / p_generic_given_brand
-            if p_generic_given_brand > 0
-            else float("inf") if p_brand_given_generic > 0
-            else 1.0
+        # In condition queries (most open), brand vs generic mention
+        condition_queries = [m for m in pair_metrics if m["query_type"] == "condition"]
+        brand_in_condition = (
+            sum(1 for m in condition_queries if m["brand_mentioned"]) / len(condition_queries)
+            if condition_queries else 0.0
         )
 
         # First-mentioned advantage
@@ -579,22 +587,36 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
         total_first = brand_first_count + generic_first_count
         first_mention_ratio = brand_first_count / total_first if total_first > 0 else 0.5
 
+        # Mention counts per query type
+        by_type = defaultdict(lambda: {"brand": 0, "generic": 0, "n": 0})
+        for m in pair_metrics:
+            qt = m["query_type"]
+            by_type[qt]["brand"] += m["brand_mention_count"]
+            by_type[qt]["generic"] += m["generic_mention_count"]
+            by_type[qt]["n"] += 1
+
         # Composite: normalize each to [0,1] and average
         norm_mention = (mention_asymmetry + 1) / 2
         norm_position = min(max(position_asymmetry / 50 + 0.5, 0), 1)
-        norm_crossref = min(cross_ref_ratio / 2, 1) if cross_ref_ratio != float("inf") else 1.0
+        norm_brand_rate = brand_mention_rate
         norm_first = first_mention_ratio
-        composite = (norm_mention + norm_position + norm_crossref + norm_first) / 4
+        composite = (norm_mention + norm_position + norm_brand_rate + norm_first) / 4
 
         results.append({
             "pair_id": pair_id,
+            "grupo_terapeutico": grupo,
+            "drug_class": drug_class,
+            "n_responses": n,
             "total_brand_mentions": total_brand,
             "total_generic_mentions": total_generic,
+            "total_inn_mentions": total_inn,
+            "brand_mention_rate": round(brand_mention_rate, 4),
+            "generic_mention_rate": round(generic_mention_rate, 4),
+            "inn_mention_rate": round(inn_mention_rate, 4),
             "mention_asymmetry": round(mention_asymmetry, 4),
             "position_asymmetry": round(position_asymmetry, 2),
-            "p_brand_given_generic_queried": round(p_brand_given_generic, 4),
-            "p_generic_given_brand_queried": round(p_generic_given_brand, 4),
-            "cross_ref_ratio": round(cross_ref_ratio, 4) if cross_ref_ratio != float("inf") else "inf",
+            "brand_in_inn_queries": round(brand_in_inn, 4),
+            "brand_in_condition_queries": round(brand_in_condition, 4),
             "brand_first_count": brand_first_count,
             "generic_first_count": generic_first_count,
             "first_mention_ratio": round(first_mention_ratio, 4),
@@ -602,6 +624,66 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
         })
 
     results.sort(key=lambda r: r["composite_asymmetry_score"], reverse=True)
+    return results
+
+
+def compute_therapeutic_area_summary(metrics_list: list[dict]) -> list[dict]:
+    """Compute brand vs generic mention counts grouped by therapeutic area.
+
+    Returns one row per grupo_terapeutico with aggregated mention counts.
+    """
+    from collections import defaultdict
+
+    by_grupo = defaultdict(list)
+    for m in metrics_list:
+        grupo = m.get("grupo_terapeutico", "Unknown")
+        by_grupo[grupo].append(m)
+
+    results = []
+    for grupo, grupo_metrics in sorted(by_grupo.items()):
+        n = len(grupo_metrics)
+        total_brand = sum(m["brand_mention_count"] for m in grupo_metrics)
+        total_generic = sum(m["generic_mention_count"] for m in grupo_metrics)
+        total_inn = sum(m.get("inn_mention_count", 0) for m in grupo_metrics)
+        denom = total_brand + total_generic
+        mention_asymmetry = (total_brand - total_generic) / denom if denom > 0 else 0.0
+
+        brand_rate = sum(1 for m in grupo_metrics if m["brand_mentioned"]) / n
+        generic_rate = sum(1 for m in grupo_metrics if m["generic_mentioned"]) / n
+
+        brand_first = sum(1 for m in grupo_metrics if m["first_drug_mentioned"] == "brand")
+        generic_first = sum(1 for m in grupo_metrics if m["first_drug_mentioned"] == "generic")
+
+        # Breakdown by query type
+        by_type = defaultdict(lambda: {"brand": 0, "generic": 0, "n": 0})
+        for m in grupo_metrics:
+            qt = m["query_type"]
+            by_type[qt]["brand"] += m["brand_mention_count"]
+            by_type[qt]["generic"] += m["generic_mention_count"]
+            by_type[qt]["n"] += 1
+
+        row = {
+            "grupo_terapeutico": grupo,
+            "n_responses": n,
+            "total_brand_mentions": total_brand,
+            "total_generic_mentions": total_generic,
+            "total_inn_mentions": total_inn,
+            "brand_mention_rate": round(brand_rate, 4),
+            "generic_mention_rate": round(generic_rate, 4),
+            "mention_asymmetry": round(mention_asymmetry, 4),
+            "brand_first": brand_first,
+            "generic_first": generic_first,
+        }
+
+        # Add per-type counts
+        for qt in ["condition", "drug_class", "inn", "recommend", "access"]:
+            if qt in by_type:
+                row[f"{qt}_brand"] = by_type[qt]["brand"]
+                row[f"{qt}_generic"] = by_type[qt]["generic"]
+                row[f"{qt}_n"] = by_type[qt]["n"]
+
+        results.append(row)
+
     return results
 
 
@@ -654,7 +736,7 @@ def analyze_all_responses() -> list[dict]:
             writer.writerows(all_metrics)
         print(f"✓ Analyzed {len(all_metrics)} responses → {metrics_file}")
 
-        # Compute and save asymmetry scores
+        # Compute and save asymmetry scores per pair
         asymmetry = compute_asymmetry_scores(all_metrics)
         if asymmetry:
             asym_file = ANALYSIS_DIR / "asymmetry_scores.csv"
@@ -664,5 +746,16 @@ def analyze_all_responses() -> list[dict]:
                 writer.writeheader()
                 writer.writerows(asymmetry)
             print(f"✓ Computed asymmetry scores for {len(asymmetry)} pairs → {asym_file}")
+
+        # Compute and save therapeutic area summary
+        area_summary = compute_therapeutic_area_summary(all_metrics)
+        if area_summary:
+            area_file = ANALYSIS_DIR / "therapeutic_area_summary.csv"
+            area_fields = list(area_summary[0].keys())
+            with open(area_file, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=area_fields)
+                writer.writeheader()
+                writer.writerows(area_summary)
+            print(f"✓ Computed therapeutic area summary for {len(area_summary)} areas → {area_file}")
 
     return all_metrics
