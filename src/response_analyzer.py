@@ -32,36 +32,29 @@ from .config import RESPONSES_DIR, ANALYSIS_DIR
 # international markets.  Keys are lowercase INN.
 
 BRAND_NAMES_BY_INN = {
-    # ── Innovative / Biologic drugs ──
-    "pembrolizumab": ["keytruda"],
-    "emicizumab": ["hemlibra"],
-    "tisagenlecleucel": ["kymriah"],
-    "tofersen": ["qalsody"],
-    "inclisirán": ["leqvio"],
-    "inclisiran": ["leqvio"],
-    "bimekizumab": ["bimzelx"],
-    "onasemnogén abeparvovec": ["zolgensma"],
-    "onasemnogen abeparvovec": ["zolgensma"],
-    "mavacamtén": ["camzyos"],
-    "mavacamten": ["camzyos"],
-    "elexacaftor/tezacaftor/ivacaftor": ["kaftrio", "trikafta"],
-    "elexacaftor": ["kaftrio", "trikafta"],
-    "adagrasib": ["krazati"],
-    # ── Traditional drugs ──
-    "omeprazol": ["losec", "mepral", "prilosec", "omeprol", "pepticum",
-                   "ulceral", "parizac", "gastrimut"],
-    "atorvastatina": ["cardyl", "lipitor", "prevencor", "zarator", "sortis",
-                       "torvast", "totalip"],
-    "amoxicilina": ["clamoxyl", "amoxil", "augmentine"],
+    # ── 20 high-volume traditional drugs ──
+    "paracetamol": ["gelocatil", "termalgin", "efferalgan", "apiretal", "dolocatil",
+                    "panadol", "tylenol"],
+    "ibuprofeno": ["nurofen", "espidifen", "dalsy", "dobupal", "bexistar",
+                   "neobrufen", "advil", "motrin", "ibufen", "algidol"],
+    "amoxicilina": ["clamoxyl", "amoxicilina beecham", "amoxil", "augmentine"],
+    "omeprazol": ["losec", "belfa", "mopral", "mepral", "prilosec"],
+    "atorvastatina": ["lipitor", "cardyl", "zarator", "sortis", "torvast", "totalip"],
+    "enalapril": ["renitec", "cardiovasil", "dilvas", "acetensil", "naprilene"],
+    "metformina": ["dianben", "glucophage"],
     "lorazepam": ["orfidal", "idalprem", "placinoral"],
-    "enalapril": ["renitec", "acetensil", "baripril", "crinoren",
-                   "dabonal", "naprilene"],
-    "fluoxetina": ["prozac", "adofen", "reneuron"],
-    "ibuprofeno": ["neobrufen", "espidifen", "dalsy", "advil", "motrin",
-                    "ibufen", "algidol"],
-    "simvastatina": ["zocor", "pantok"],
-    "ciprofloxacino": ["baycip", "ciproxin", "cetraxal"],
     "sertralina": ["besitran", "aremis", "zoloft"],
+    "salbutamol": ["ventolin", "buto asma", "salbulair", "ventolin accuhaler"],
+    "amlodipino": ["norvasc", "astudal", "neotensin", "istin"],
+    "azitromicina": ["zithromax", "vinzam", "toraseptol", "sumamed"],
+    "simvastatina": ["zocor", "pantok", "algoren"],
+    "fluoxetina": ["prozac", "adofen", "reneuron"],
+    "ramipril": ["altace", "acovil", "ramicor", "triatec", "tritace"],
+    "diclofenaco": ["voltaren", "artrotec"],
+    "pantoprazol": ["pantoc", "anagastra", "pantoloc", "pantecta", "zurcal"],
+    "levotiroxina": ["eutirox", "levothroid", "synthroid", "levothyrox"],
+    "alprazolam": ["trankimazin", "tranquimazin retard", "xanax"],
+    "ciprofloxacino": ["baycip", "rigoran", "ciflosin", "ciproxin", "cetraxal"],
 }
 
 # Common generic pharmaceutical laboratory names in Spain
@@ -188,10 +181,11 @@ def _extract_inn(principio_activo: str) -> str:
     return " ".join(inn_words).lower()
 
 
-def _get_brand_names(inn: str, pair_brand: str = "") -> list[str]:
+def _get_brand_names(inn: str, pair_brand: str = "",
+                     pair_brands: list = None) -> list[str]:
     """Get all known brand names for a given INN.
 
-    Combines the knowledge base with the specific pair brand name.
+    Combines the knowledge base with the pair's brand list.
     Returns lowercase list of brand names (shortest first for matching).
     """
     brands = set()
@@ -199,20 +193,22 @@ def _get_brand_names(inn: str, pair_brand: str = "") -> list[str]:
     # Add from knowledge base
     for known_inn, known_brands in BRAND_NAMES_BY_INN.items():
         if known_inn == inn or inn.startswith(known_inn):
-            brands.update(known_brands)
+            brands.update(b.lower() for b in known_brands)
 
-    # Add the pair's specific brand short name
-    if pair_brand:
-        short = _extract_short_name(pair_brand)
+    # Add all brands from pair metadata
+    all_pair_brands = pair_brands or ([pair_brand] if pair_brand else [])
+    for b in all_pair_brands:
+        if not b:
+            continue
+        short = _extract_short_name(b)
         if short:
-            brands.add(short)
-            # Also add just the first word if multi-word
+            brands.add(short.lower())
             first = short.split()[0]
             if first and len(first) >= 3:
-                brands.add(first)
+                brands.add(first.lower())
 
     # Remove the INN itself from brand names (it's generic)
-    brands.discard(inn)
+    brands.discard(inn.lower())
 
     return sorted(brands, key=len)
 
@@ -289,12 +285,13 @@ def _find_mentions(text: str, drug_name: str) -> list[int]:
     return positions
 
 
-def _find_all_brand_mentions(text: str, inn: str, pair_brand: str = "") -> tuple[list[int], list[str]]:
+def _find_all_brand_mentions(text: str, inn: str, pair_brand: str = "",
+                             pair_brands: list = None) -> tuple[list[int], list[str]]:
     """Find all brand name mentions in text for a given INN.
 
     Returns (positions, brand_names_found).
     """
-    brand_names = _get_brand_names(inn, pair_brand)
+    brand_names = _get_brand_names(inn, pair_brand, pair_brands=pair_brands)
     all_positions = []
     found_names = []
 
@@ -390,6 +387,12 @@ def analyze_response(response_text: str, query: dict) -> dict:
     sentences = [s.strip() for s in re.split(r'[.!?]+', response_text) if s.strip()]
 
     brand_name = query.get("brand_name", "")
+    brand_names_raw = query.get("brand_names", [])
+    if isinstance(brand_names_raw, str):
+        pair_brands = [b.strip() for b in brand_names_raw.split(";") if b.strip()]
+    else:
+        pair_brands = brand_names_raw or ([brand_name] if brand_name else [])
+
     generic_names_raw = query.get("generic_names", [])
     if isinstance(generic_names_raw, str):
         generic_names = [g.strip() for g in generic_names_raw.split(";") if g.strip()]
@@ -407,7 +410,7 @@ def analyze_response(response_text: str, query: dict) -> dict:
 
     # ── 2. Brand name detection (broad: all known brands for this INN) ──
     brand_positions, brand_names_found = _find_all_brand_mentions(
-        response_text, inn, pair_brand=brand_name
+        response_text, inn, pair_brand=brand_name, pair_brands=pair_brands
     )
     brand_mentioned = len(brand_positions) > 0
     brand_mention_count = len(brand_positions)
@@ -591,31 +594,16 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             sum(position_diffs) / len(position_diffs) if position_diffs else 0.0
         )
 
-        # Cross-reference: in open queries, does brand or generic-product appear?
-        open_types = ("condition", "drug_class")
-        open_queries = [m for m in pair_metrics if m["query_type"] in open_types]
-        brand_in_open = (
-            sum(1 for m in open_queries if m["brand_mentioned"]) / len(open_queries)
-            if open_queries else 0.0
-        )
-        generic_in_open = (
-            sum(1 for m in open_queries if m["generic_mentioned"]) / len(open_queries)
-            if open_queries else 0.0
-        )
-
-        # Cross-reference: in brand queries, does INN/generic get mentioned?
-        brand_queries = [m for m in pair_metrics if m["query_type"] == "brand"]
-        inn_in_brand = (
-            sum(1 for m in brand_queries if m.get("inn_mentioned", False)) / len(brand_queries)
-            if brand_queries else 0.0
-        )
-
-        # Cross-reference: in INN queries, does brand get mentioned?
-        inn_queries = [m for m in pair_metrics if m["query_type"] == "inn"]
-        brand_in_inn = (
-            sum(1 for m in inn_queries if m["brand_mentioned"]) / len(inn_queries)
-            if inn_queries else 0.0
-        )
+        # Per-type breakdown (all queries are open now)
+        by_type = {}
+        for m in pair_metrics:
+            qt = m["query_type"]
+            if qt not in by_type:
+                by_type[qt] = {"brand": 0, "generic": 0, "inn": 0, "n": 0}
+            by_type[qt]["brand"] += m["brand_mention_count"]
+            by_type[qt]["generic"] += m["generic_mention_count"]
+            by_type[qt]["inn"] += m.get("inn_mention_count", 0)
+            by_type[qt]["n"] += 1
 
         # First-mentioned advantage (brand vs generic-product, ignoring INN-only)
         brand_first_count = sum(1 for m in pair_metrics if m["first_drug_mentioned"] == "brand")
@@ -630,7 +618,7 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
         norm_first = first_mention_ratio
         composite = (norm_mention + norm_position + norm_brand_rate + norm_first) / 4
 
-        results.append({
+        row = {
             "pair_id": pair_id,
             "grupo_terapeutico": grupo,
             "drug_class": drug_class,
@@ -643,15 +631,19 @@ def compute_asymmetry_scores(metrics_list: list[dict]) -> list[dict]:
             "inn_mention_rate": round(inn_mention_rate, 4),
             "mention_asymmetry": round(mention_asymmetry, 4),
             "position_asymmetry": round(position_asymmetry, 2),
-            "brand_in_open_queries": round(brand_in_open, 4),
-            "generic_in_open_queries": round(generic_in_open, 4),
-            "brand_in_inn_queries": round(brand_in_inn, 4),
-            "inn_in_brand_queries": round(inn_in_brand, 4),
             "brand_first_count": brand_first_count,
             "generic_first_count": generic_first_count,
             "first_mention_ratio": round(first_mention_ratio, 4),
             "composite_asymmetry_score": round(composite, 4),
-        })
+        }
+
+        # Add per-type breakdowns
+        for qt in sorted(by_type):
+            row[f"{qt}_brand"] = by_type[qt]["brand"]
+            row[f"{qt}_generic"] = by_type[qt]["generic"]
+            row[f"{qt}_inn"] = by_type[qt]["inn"]
+
+        results.append(row)
 
     results.sort(key=lambda r: r["composite_asymmetry_score"], reverse=True)
     return results
@@ -706,11 +698,10 @@ def compute_therapeutic_area_summary(metrics_list: list[dict]) -> list[dict]:
         }
 
         # Add per-type counts
-        for qt in ["condition", "drug_class", "inn", "brand", "recommend", "access"]:
-            if qt in by_type:
-                row[f"{qt}_brand"] = by_type[qt]["brand"]
-                row[f"{qt}_generic"] = by_type[qt]["generic"]
-                row[f"{qt}_n"] = by_type[qt]["n"]
+        for qt in sorted(by_type):
+            row[f"{qt}_brand"] = by_type[qt]["brand"]
+            row[f"{qt}_generic"] = by_type[qt]["generic"]
+            row[f"{qt}_n"] = by_type[qt]["n"]
 
         results.append(row)
 
