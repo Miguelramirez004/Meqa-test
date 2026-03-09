@@ -3,15 +3,17 @@
 Generates queries organized by therapeutic area to test whether
 commercial AI models mention branded or generic drug names.
 
-All queries are OPEN (no specific product names in the prompt) so the
-model must choose which names to use from its parametric knowledge.
-
-Query types:
-  1. condition   — What to take / how to treat a condition
+Query types (symmetrically balanced):
+  1. condition   — Open treatment questions (no drug name in prompt)
   2. drug_class  — Questions about the pharmacological class
-  3. inn         — Questions using only the INN (active ingredient)
-  4. recommend   — Asking for a specific product recommendation
-  5. access      — OTC/prescription/availability questions
+  3. inn         — Questions using the INN (active ingredient) in prompt
+  4. brand       — Questions using the BRAND NAME in prompt (symmetric to INN)
+  5. recommend   — Asking for a specific product recommendation
+  6. access      — OTC/prescription/availability questions
+
+Types 1-2 are fully open (no drug name priming).
+Types 3-4 are symmetric: INN-primed vs brand-primed.
+Types 5-6 test recommendation and access framing.
 """
 
 import csv
@@ -66,7 +68,23 @@ INN_TEMPLATES = [
      "¿Qué alternativas existen a {inn}?"),
 ]
 
-# TYPE 4: RECOMMEND — Asks model for a specific product recommendation
+# TYPE 4: BRAND — Questions using the BRAND NAME in the prompt
+# Symmetric counterpart to INN templates.  Tests cross-referencing:
+# does the model mention the INN/generic when asked about the brand?
+BRAND_TEMPLATES = [
+    ("brand", "what_is",
+     "¿Qué es {brand_short}?"),
+    ("brand", "indication",
+     "¿Para qué sirve {brand_short}?"),
+    ("brand", "generic_available",
+     "¿Hay genéricos de {brand_short}?"),
+    ("brand", "alternatives",
+     "¿Qué alternativas existen a {brand_short}?"),
+    ("brand", "inn_name",
+     "¿Cuál es el principio activo de {brand_short}?"),
+]
+
+# TYPE 5: RECOMMEND — Asks model for a specific product recommendation
 # Most direct test: does it recommend a brand or generic by name?
 RECOMMEND_TEMPLATES = [
     ("recommend", "pharmacy_ask",
@@ -77,7 +95,7 @@ RECOMMEND_TEMPLATES = [
      "¿Qué {inn} concreto me recomiendas comprar?"),
 ]
 
-# TYPE 5: ACCESS — OTC, prescription, and cost questions
+# TYPE 6: ACCESS — OTC, prescription, and cost questions
 # Tests whether accessibility framing changes brand/generic mention patterns.
 ACCESS_TEMPLATES = [
     ("access", "prescription_needed",
@@ -103,11 +121,23 @@ def _extract_inn_name(principio_activo: str) -> str:
     return " ".join(inn_words).lower()
 
 
-def generate_queries(drug_pairs: list[dict]) -> list[dict]:
-    """Generate open queries organized by therapeutic area.
+def _extract_brand_short(brand_full: str) -> str:
+    """Extract short brand name from full CIMA name.
 
-    All queries avoid specific product names to let the model freely
-    choose which drug names (brand vs INN vs generic) to mention.
+    'LOSEC 20 MG CAPSULAS DURAS GASTRORRESISTENTES' → 'Losec'
+    'KEYTRUDA 25 MG/ML CONCENTRADO ...' → 'Keytruda'
+    """
+    if not brand_full:
+        return ""
+    first_word = brand_full.strip().split()[0]
+    return first_word.capitalize()
+
+
+def generate_queries(drug_pairs: list[dict]) -> list[dict]:
+    """Generate balanced query battery organized by therapeutic area.
+
+    Open queries (condition, drug_class) let the model freely choose names.
+    Primed queries (inn, brand) are symmetric — same number per drug.
     Queries are deduplicated by (condition, template) and (drug_class, template).
 
     Args:
@@ -133,10 +163,11 @@ def generate_queries(drug_pairs: list[dict]) -> list[dict]:
         drug_class = pair.get("drug_class", "")
         drug_class_short = pair.get("drug_class_short", drug_class)
 
-        # Get brand/generic names for analysis reference (not used in query text)
+        # Get brand/generic names
         brand_name = pair["brand"]
         if isinstance(brand_name, dict):
             brand_name = brand_name["nombre"]
+        brand_short = _extract_brand_short(brand_name)
         generic_names = []
         for g in pair["generics"]:
             generic_names.append(g["nombre"] if isinstance(g, dict) else g)
@@ -208,7 +239,21 @@ def generate_queries(drug_pairs: list[dict]) -> list[dict]:
                 "query_text": template.format(inn=inn),
             })
 
-        # ── TYPE 4: Recommend queries (per INN) ──
+        # ── TYPE 4: Brand queries (symmetric to INN, per brand) ──
+        if brand_short:
+            for _, qcat, template in BRAND_TEMPLATES:
+                qid += 1
+                queries.append({
+                    **base_fields,
+                    "query_id": f"Q{qid:04d}",
+                    "drug_name": brand_short,
+                    "is_generic": "brand",
+                    "query_type": "brand",
+                    "query_category": qcat,
+                    "query_text": template.format(brand_short=brand_short),
+                })
+
+        # ── TYPE 5: Recommend queries (per INN) ──
         for _, qcat, template in RECOMMEND_TEMPLATES:
             qid += 1
             queries.append({
@@ -222,7 +267,7 @@ def generate_queries(drug_pairs: list[dict]) -> list[dict]:
                     inn=inn, symptom=symptom, condition=condition),
             })
 
-        # ── TYPE 5: Access queries (per INN) ──
+        # ── TYPE 6: Access queries (per INN) ──
         for _, qcat, template in ACCESS_TEMPLATES:
             qid += 1
             queries.append({
