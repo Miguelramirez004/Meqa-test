@@ -32,36 +32,29 @@ from .config import RESPONSES_DIR, ANALYSIS_DIR
 # international markets.  Keys are lowercase INN.
 
 BRAND_NAMES_BY_INN = {
-    # ── Innovative / Biologic drugs ──
-    "pembrolizumab": ["keytruda"],
-    "emicizumab": ["hemlibra"],
-    "tisagenlecleucel": ["kymriah"],
-    "tofersen": ["qalsody"],
-    "inclisirán": ["leqvio"],
-    "inclisiran": ["leqvio"],
-    "bimekizumab": ["bimzelx"],
-    "onasemnogén abeparvovec": ["zolgensma"],
-    "onasemnogen abeparvovec": ["zolgensma"],
-    "mavacamtén": ["camzyos"],
-    "mavacamten": ["camzyos"],
-    "elexacaftor/tezacaftor/ivacaftor": ["kaftrio", "trikafta"],
-    "elexacaftor": ["kaftrio", "trikafta"],
-    "adagrasib": ["krazati"],
-    # ── Traditional drugs ──
-    "omeprazol": ["losec", "mepral", "prilosec", "omeprol", "pepticum",
-                   "ulceral", "parizac", "gastrimut"],
-    "atorvastatina": ["cardyl", "lipitor", "prevencor", "zarator", "sortis",
-                       "torvast", "totalip"],
-    "amoxicilina": ["clamoxyl", "amoxil", "augmentine"],
+    # ── 20 high-volume traditional drugs ──
+    "paracetamol": ["gelocatil", "termalgin", "efferalgan", "apiretal", "dolocatil",
+                    "panadol", "tylenol"],
+    "ibuprofeno": ["nurofen", "espidifen", "dalsy", "dobupal", "bexistar",
+                   "neobrufen", "advil", "motrin", "ibufen", "algidol"],
+    "amoxicilina": ["clamoxyl", "amoxicilina beecham", "amoxil", "augmentine"],
+    "omeprazol": ["losec", "belfa", "mopral", "mepral", "prilosec"],
+    "atorvastatina": ["lipitor", "cardyl", "zarator", "sortis", "torvast", "totalip"],
+    "enalapril": ["renitec", "cardiovasil", "dilvas", "acetensil", "naprilene"],
+    "metformina": ["dianben", "glucophage"],
     "lorazepam": ["orfidal", "idalprem", "placinoral"],
-    "enalapril": ["renitec", "acetensil", "baripril", "crinoren",
-                   "dabonal", "naprilene"],
-    "fluoxetina": ["prozac", "adofen", "reneuron"],
-    "ibuprofeno": ["neobrufen", "espidifen", "dalsy", "advil", "motrin",
-                    "ibufen", "algidol"],
-    "simvastatina": ["zocor", "pantok"],
-    "ciprofloxacino": ["baycip", "ciproxin", "cetraxal"],
     "sertralina": ["besitran", "aremis", "zoloft"],
+    "salbutamol": ["ventolin", "buto asma", "salbulair", "ventolin accuhaler"],
+    "amlodipino": ["norvasc", "astudal", "neotensin", "istin"],
+    "azitromicina": ["zithromax", "vinzam", "toraseptol", "sumamed"],
+    "simvastatina": ["zocor", "pantok", "algoren"],
+    "fluoxetina": ["prozac", "adofen", "reneuron"],
+    "ramipril": ["altace", "acovil", "ramicor", "triatec", "tritace"],
+    "diclofenaco": ["voltaren", "artrotec"],
+    "pantoprazol": ["pantoc", "anagastra", "pantoloc", "pantecta", "zurcal"],
+    "levotiroxina": ["eutirox", "levothroid", "synthroid", "levothyrox"],
+    "alprazolam": ["trankimazin", "tranquimazin retard", "xanax"],
+    "ciprofloxacino": ["baycip", "rigoran", "ciflosin", "ciproxin", "cetraxal"],
 }
 
 # Common generic pharmaceutical laboratory names in Spain
@@ -188,10 +181,11 @@ def _extract_inn(principio_activo: str) -> str:
     return " ".join(inn_words).lower()
 
 
-def _get_brand_names(inn: str, pair_brand: str = "") -> list[str]:
+def _get_brand_names(inn: str, pair_brand: str = "",
+                     pair_brands: list = None) -> list[str]:
     """Get all known brand names for a given INN.
 
-    Combines the knowledge base with the specific pair brand name.
+    Combines the knowledge base with the pair's brand list.
     Returns lowercase list of brand names (shortest first for matching).
     """
     brands = set()
@@ -199,20 +193,22 @@ def _get_brand_names(inn: str, pair_brand: str = "") -> list[str]:
     # Add from knowledge base
     for known_inn, known_brands in BRAND_NAMES_BY_INN.items():
         if known_inn == inn or inn.startswith(known_inn):
-            brands.update(known_brands)
+            brands.update(b.lower() for b in known_brands)
 
-    # Add the pair's specific brand short name
-    if pair_brand:
-        short = _extract_short_name(pair_brand)
+    # Add all brands from pair metadata
+    all_pair_brands = pair_brands or ([pair_brand] if pair_brand else [])
+    for b in all_pair_brands:
+        if not b:
+            continue
+        short = _extract_short_name(b)
         if short:
-            brands.add(short)
-            # Also add just the first word if multi-word
+            brands.add(short.lower())
             first = short.split()[0]
             if first and len(first) >= 3:
-                brands.add(first)
+                brands.add(first.lower())
 
     # Remove the INN itself from brand names (it's generic)
-    brands.discard(inn)
+    brands.discard(inn.lower())
 
     return sorted(brands, key=len)
 
@@ -289,12 +285,13 @@ def _find_mentions(text: str, drug_name: str) -> list[int]:
     return positions
 
 
-def _find_all_brand_mentions(text: str, inn: str, pair_brand: str = "") -> tuple[list[int], list[str]]:
+def _find_all_brand_mentions(text: str, inn: str, pair_brand: str = "",
+                             pair_brands: list = None) -> tuple[list[int], list[str]]:
     """Find all brand name mentions in text for a given INN.
 
     Returns (positions, brand_names_found).
     """
-    brand_names = _get_brand_names(inn, pair_brand)
+    brand_names = _get_brand_names(inn, pair_brand, pair_brands=pair_brands)
     all_positions = []
     found_names = []
 
@@ -390,6 +387,12 @@ def analyze_response(response_text: str, query: dict) -> dict:
     sentences = [s.strip() for s in re.split(r'[.!?]+', response_text) if s.strip()]
 
     brand_name = query.get("brand_name", "")
+    brand_names_raw = query.get("brand_names", [])
+    if isinstance(brand_names_raw, str):
+        pair_brands = [b.strip() for b in brand_names_raw.split(";") if b.strip()]
+    else:
+        pair_brands = brand_names_raw or ([brand_name] if brand_name else [])
+
     generic_names_raw = query.get("generic_names", [])
     if isinstance(generic_names_raw, str):
         generic_names = [g.strip() for g in generic_names_raw.split(";") if g.strip()]
@@ -407,7 +410,7 @@ def analyze_response(response_text: str, query: dict) -> dict:
 
     # ── 2. Brand name detection (broad: all known brands for this INN) ──
     brand_positions, brand_names_found = _find_all_brand_mentions(
-        response_text, inn, pair_brand=brand_name
+        response_text, inn, pair_brand=brand_name, pair_brands=pair_brands
     )
     brand_mentioned = len(brand_positions) > 0
     brand_mention_count = len(brand_positions)

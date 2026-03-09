@@ -71,6 +71,7 @@ def generate_queries(drug_pairs: list[dict]) -> list[dict]:
         brand_name = pair["brand"]
         if isinstance(brand_name, dict):
             brand_name = brand_name["nombre"]
+        brand_names = pair.get("brands", [brand_name])
         generic_names = []
         for g in pair["generics"]:
             generic_names.append(g["nombre"] if isinstance(g, dict) else g)
@@ -82,6 +83,7 @@ def generate_queries(drug_pairs: list[dict]) -> list[dict]:
             "drug_class": drug_class,
             "drug_class_short": drug_class_short,
             "brand_name": brand_name,
+            "brand_names": brand_names,
             "generic_names": generic_names,
             "condition": condition,
             "symptom": symptom,
@@ -143,6 +145,8 @@ def save_queries(queries: list[dict],
     csv_queries = []
     for q in queries:
         row = dict(q)
+        if isinstance(row.get("brand_names"), list):
+            row["brand_names"] = "; ".join(row["brand_names"])
         if isinstance(row.get("generic_names"), list):
             row["generic_names"] = "; ".join(row["generic_names"])
         csv_queries.append(row)
