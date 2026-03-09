@@ -814,7 +814,6 @@ def collect_all_responses(
     llm = ChatOpenAI(
         model=model,
         temperature=0.3,
-        max_tokens=800,
         openai_api_key=api_key,
     )
 

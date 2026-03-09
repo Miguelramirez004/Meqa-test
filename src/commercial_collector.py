@@ -115,7 +115,6 @@ def query_commercial_model(
     model: str,
     client,
     temperature: float = 0.3,
-    max_tokens: int = 800,
 ) -> str:
     """Send a single query to a commercial model and return the response text.
 
@@ -131,7 +130,6 @@ def query_commercial_model(
                     {"role": "user", "content": query_text},
                 ],
                 temperature=temperature,
-                max_tokens=max_tokens,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
