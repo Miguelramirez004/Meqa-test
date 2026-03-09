@@ -11,8 +11,13 @@ the model "knows" on its own.
 
 Supported models:
   - OpenAI: gpt-4o, gpt-4o-mini, gpt-3.5-turbo
-  - Google: gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash
+  - Google: gemini-2.0-flash, gemini-2.0-flash-lite
   - Perplexity: llama-3.1-sonar-small-128k-online, etc.
+
+Notes on Gemini:
+  - gemini-1.5-* models are deprecated (404)
+  - gemini-2.0-flash is the current stable model
+  - gemini-2.0-flash-lite has higher free-tier rate limits
 """
 
 import json
@@ -62,7 +67,8 @@ PROVIDER_PREFIXES = {
 
 PROVIDER_MODELS = {
     "openai": ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
-    "gemini": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+    # gemini-1.5-* deprecated as of 2026 (returns 404)
+    "gemini": ["gemini-2.0-flash", "gemini-2.0-flash-lite"],
     "perplexity": [
         "llama-3.1-sonar-small-128k-online",
         "llama-3.1-sonar-large-128k-online",
@@ -111,21 +117,44 @@ def query_commercial_model(
     temperature: float = 0.3,
     max_tokens: int = 800,
 ) -> str:
-    """Send a single query to a commercial model and return the response text."""
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": query_text},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error("Model query failed: %s", e)
-        return ""
+    """Send a single query to a commercial model and return the response text.
+
+    Retries once with exponential backoff on rate-limit errors (429/409).
+    Returns empty string on unrecoverable errors (logged with full message).
+    """
+    for attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": query_text},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            err_str = str(e)
+            status = getattr(e, "status_code", None)
+            # Rate limit or quota: retry after backoff
+            if status in (429, 409) and attempt == 0:
+                wait = 10
+                logger.warning(
+                    "Rate limit / quota error for %s (HTTP %s): %s — retrying in %ss",
+                    model, status, err_str, wait,
+                )
+                time.sleep(wait)
+                continue
+            # 404 = model not found
+            if status == 404:
+                logger.error(
+                    "Model not found: '%s'. Check model name. Error: %s", model, err_str
+                )
+            else:
+                logger.error("Model query failed [HTTP %s]: %s", status, err_str)
+            return ""
+    return ""
 
 
 def collect_commercial_responses(
@@ -183,6 +212,7 @@ def collect_commercial_responses(
             "grupo_terapeutico": query.get("grupo_terapeutico", ""),
             "drug_name": query.get("drug_name", ""),
             "brand_name": query.get("brand_name", ""),
+            "brand_names": query.get("brand_names", []),
             "generic_names": query.get("generic_names", []),
             "is_generic": query.get("is_generic", ""),
             "query_type": query.get("query_type", ""),
