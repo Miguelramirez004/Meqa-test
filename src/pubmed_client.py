@@ -63,7 +63,7 @@ class PubMedClient:
                  tool: str = NCBI_TOOL, delay: float = PUBMED_DELAY,
                  timeout: int = 30, retries: int = 2):
         self.base_url = PUBMED_BASE_URL
-        self.api_key = api_key
+        self.api_key = api_key.strip() if api_key else None
         self.email = email
         self.tool = tool
         self.delay = delay if not api_key else 0.12  # 10/s with key
@@ -300,7 +300,7 @@ def collect_pubmed_for_all_pairs(
     format compatible with the Streamlit UI (keys: total_found, queries, articles).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    client = PubMedClient(api_key=api_key or None, email=email)
+    client = PubMedClient(api_key=api_key.strip() or None, email=email)
 
     # Logging visible in Streamlit logs
     logging.basicConfig(level=logging.INFO, format="%(name)s %(message)s")
