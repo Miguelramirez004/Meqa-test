@@ -10,6 +10,7 @@ PROSPECTOS_DIR = DATA_DIR / "prospectos"
 QUERIES_DIR = DATA_DIR / "queries"
 RESPONSES_DIR = DATA_DIR / "responses"
 ANALYSIS_DIR = DATA_DIR / "analysis"
+PUBMED_DIR = DATA_DIR / "pubmed"
 
 # ── CIMA API ─────────────────────────────────────────────────────────────────
 CIMA_BASE_URL = "https://cima.aemps.es/cima/rest"

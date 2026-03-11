@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import (
     DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR,
+    PUBMED_DIR,
 )
 from src.drug_pairs import get_offline_pairs, OFFLINE_PAIRS
 from src.query_generator import generate_queries, save_queries
@@ -27,6 +28,7 @@ from src.commercial_collector import (
     collect_commercial_responses, detect_provider,
     PROVIDER_MODELS, get_all_models,
 )
+from src.pubmed_client import PubMedClient, collect_pubmed_data
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -51,6 +53,7 @@ page = st.sidebar.radio(
         "4. Collect Responses",
         "5. Analyze Responses",
         "6. Statistical Analysis",
+        "7. PubMed Literature",
     ],
 )
 
@@ -61,7 +64,7 @@ st.sidebar.caption("Doctoral research — GEO asymmetry in MeQA (AEMPS)")
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def ensure_dirs():
-    for d in [DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR]:
+    for d in [DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR, PUBMED_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -917,3 +920,168 @@ elif page == "6. Statistical Analysis":
             })
             csv_summary = summary_data.to_csv().encode("utf-8")
             st.download_button("Download Summary CSV", csv_summary, "summary_report.csv", "text/csv")
+
+
+# ── Page 7: PubMed Literature ────────────────────────────────────────────────
+
+elif page == "7. PubMed Literature":
+    st.header("PubMed Literature Data")
+    st.markdown(
+        "Collect publication data from **PubMed** for each drug pair. "
+        "Runs four searches per pair:\n\n"
+        "1. **Brand name** — publications mentioning the brand (e.g., *Losec*)\n"
+        "2. **INN (active ingredient)** — publications mentioning the INN (e.g., *omeprazol*)\n"
+        "3. **Brand vs Generic** — comparative/equivalence studies\n"
+        "4. **Bioequivalence** — bioequivalence studies for the active ingredient\n\n"
+        "Uses the [NCBI E-utilities API](https://www.ncbi.nlm.nih.gov/books/NBK25500/) "
+        "(free, no API key required for low-volume use)."
+    )
+
+    # Show existing data
+    existing_pubmed = list(PUBMED_DIR.glob("P*_pubmed.json"))
+    combined_file = PUBMED_DIR / "pubmed_all_pairs.json"
+
+    if existing_pubmed:
+        st.success(f"**{len(existing_pubmed)}** drug pairs already collected.")
+
+    st.markdown("---")
+
+    # API key (optional)
+    ncbi_key = st.text_input(
+        "NCBI API Key (optional)",
+        type="password",
+        help="Optional. Without a key, NCBI allows ~3 requests/second. "
+             "With a key, up to 10 req/s. Get one at: "
+             "https://www.ncbi.nlm.nih.gov/account/settings/",
+    )
+
+    top_n = st.slider(
+        "Article summaries per search",
+        min_value=1, max_value=20, value=5,
+        help="How many top article summaries to fetch for each search query.",
+    )
+
+    if st.button("Collect PubMed Data", type="primary"):
+        pairs = get_offline_pairs()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        client = PubMedClient(api_key=ncbi_key if ncbi_key else None)
+        results = []
+
+        for i, pair in enumerate(pairs):
+            status_text.text(
+                f"Searching PubMed for {pair['pair_id']} — "
+                f"{pair['principio_activo']}..."
+            )
+            pair_data = client.collect_for_pair(pair, top_n=top_n)
+
+            from dataclasses import asdict
+            serialised = asdict(pair_data)
+            results.append(serialised)
+
+            # Save individual file
+            pair_file = PUBMED_DIR / f"{pair['pair_id']}_pubmed.json"
+            with open(pair_file, "w", encoding="utf-8") as f:
+                json.dump(serialised, f, ensure_ascii=False, indent=2)
+
+            progress_bar.progress((i + 1) / len(pairs))
+
+        # Save combined
+        with open(combined_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"Collected PubMed data for **{len(results)}** drug pairs.")
+        st.rerun()
+
+    # ── Display results ──
+    if combined_file.exists():
+        st.markdown("---")
+        st.subheader("Results Overview")
+
+        with open(combined_file, encoding="utf-8") as f:
+            all_pubmed = json.load(f)
+
+        # Summary table
+        summary_rows = []
+        for r in all_pubmed:
+            brand_count = r["brand_search"]["total_count"] if r["brand_search"] else 0
+            inn_count = r["inn_search"]["total_count"] if r["inn_search"] else 0
+            bvg_count = r["brand_vs_generic_search"]["total_count"] if r["brand_vs_generic_search"] else 0
+            bioeq_count = r["bioequivalence_search"]["total_count"] if r["bioequivalence_search"] else 0
+            summary_rows.append({
+                "Pair ID": r["pair_id"],
+                "Active Ingredient": r["principio_activo"],
+                "Brand": r["brand_name"],
+                "Brand Pubs": brand_count,
+                "INN Pubs": inn_count,
+                "Brand vs Generic": bvg_count,
+                "Bioequivalence": bioeq_count,
+                "INN/Brand Ratio": round(inn_count / brand_count, 1) if brand_count > 0 else "N/A",
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
+
+        # Bar chart: Brand vs INN publication counts
+        st.markdown("#### Publication Counts: Brand vs INN")
+        chart_df = summary_df[["Pair ID", "Brand Pubs", "INN Pubs"]].set_index("Pair ID")
+        st.bar_chart(chart_df)
+
+        # Bioequivalence chart
+        st.markdown("#### Bioequivalence Studies per Drug")
+        bioeq_df = summary_df[["Pair ID", "Bioequivalence"]].set_index("Pair ID")
+        st.bar_chart(bioeq_df)
+
+        # Expandable detail per pair
+        st.markdown("---")
+        st.subheader("Detailed Results per Drug Pair")
+
+        for r in all_pubmed:
+            with st.expander(
+                f"**{r['pair_id']}** — {r['principio_activo']} ({r['brand_name']})",
+                expanded=False,
+            ):
+                for search_key, label in [
+                    ("brand_search", "Brand Name Search"),
+                    ("inn_search", "INN (Active Ingredient) Search"),
+                    ("brand_vs_generic_search", "Brand vs Generic Comparison"),
+                    ("bioequivalence_search", "Bioequivalence Studies"),
+                ]:
+                    search = r.get(search_key)
+                    if not search:
+                        continue
+
+                    st.markdown(f"**{label}** — {search['total_count']} results")
+                    st.caption(f"Query: `{search['query']}`")
+
+                    if search.get("articles"):
+                        for art in search["articles"]:
+                            authors = ", ".join(art.get("authors", []))
+                            st.markdown(
+                                f"- **{art['title']}** — {art.get('source', '')} "
+                                f"({art.get('pubdate', '')}) {authors}"
+                            )
+                    st.markdown("")
+
+        # Download
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            json_bytes = json.dumps(all_pubmed, ensure_ascii=False, indent=2).encode("utf-8")
+            st.download_button(
+                "Download All PubMed Data (JSON)",
+                json_bytes,
+                "pubmed_all_pairs.json",
+                "application/json",
+            )
+        with col2:
+            csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Summary (CSV)",
+                csv_bytes,
+                "pubmed_summary.csv",
+                "text/csv",
+            )
