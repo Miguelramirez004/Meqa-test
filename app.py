@@ -928,11 +928,15 @@ elif page == "7. PubMed Literature":
     st.header("PubMed Literature Data")
     st.markdown(
         "Collect publication data from **PubMed** for each drug pair. "
-        "Runs four searches per pair:\n\n"
-        "1. **Brand name** — publications mentioning the brand (e.g., *Losec*)\n"
-        "2. **INN (active ingredient)** — publications mentioning the INN (e.g., *omeprazol*)\n"
-        "3. **Brand vs Generic** — comparative/equivalence studies\n"
-        "4. **Bioequivalence** — bioequivalence studies for the active ingredient\n\n"
+        "Searches **all known brand names** and **generic laboratory products** "
+        "per drug pair:\n\n"
+        "1. **All brand names** — every known brand (Spanish + international) "
+        "for each INN\n"
+        "2. **INN (active ingredient)** — publications mentioning the INN\n"
+        "3. **All generic labs** — INN + each laboratory name "
+        "(e.g., *omeprazol* + *Cinfa*, *Teva*, *Sandoz*, ...)\n"
+        "4. **Brand vs Generic** — comparative/equivalence studies\n"
+        "5. **Bioequivalence** — bioequivalence studies\n\n"
         "Uses the [NCBI E-utilities API](https://www.ncbi.nlm.nih.gov/books/NBK25500/) "
         "(free, no API key required for low-volume use)."
     )
@@ -970,9 +974,12 @@ elif page == "7. PubMed Literature":
         results = []
 
         for i, pair in enumerate(pairs):
+            n_brands = len(client._get_all_brands(pair))
+            n_labs = len(client._get_generic_labs(pair))
             status_text.text(
-                f"Searching PubMed for {pair['pair_id']} — "
-                f"{pair['principio_activo']}..."
+                f"[{i+1}/{len(pairs)}] {pair['pair_id']} — "
+                f"{pair['principio_activo']} "
+                f"({n_brands} brands, {n_labs} labs)..."
             )
             pair_data = client.collect_for_pair(pair, top_n=top_n)
 
@@ -1007,33 +1014,87 @@ elif page == "7. PubMed Literature":
         # Summary table
         summary_rows = []
         for r in all_pubmed:
-            brand_count = r["brand_search"]["total_count"] if r["brand_search"] else 0
-            inn_count = r["inn_search"]["total_count"] if r["inn_search"] else 0
-            bvg_count = r["brand_vs_generic_search"]["total_count"] if r["brand_vs_generic_search"] else 0
-            bioeq_count = r["bioequivalence_search"]["total_count"] if r["bioequivalence_search"] else 0
+            total_brand = r.get("total_brand_pubs", 0)
+            inn_count = r["inn_search"]["total_count"] if r.get("inn_search") else 0
+            total_generic = r.get("total_generic_pubs", 0)
+            bvg_count = r["brand_vs_generic_search"]["total_count"] if r.get("brand_vs_generic_search") else 0
+            bioeq_count = r["bioequivalence_search"]["total_count"] if r.get("bioequivalence_search") else 0
+            n_brands = len(r.get("all_brands", []))
+            n_labs = len(r.get("generic_labs_searched", []))
             summary_rows.append({
                 "Pair ID": r["pair_id"],
                 "Active Ingredient": r["principio_activo"],
-                "Brand": r["brand_name"],
-                "Brand Pubs": brand_count,
+                "Primary Brand": r["brand_name"],
+                "Brands Searched": n_brands,
+                "Total Brand Pubs": total_brand,
                 "INN Pubs": inn_count,
+                "Labs Searched": n_labs,
+                "Total Generic Pubs": total_generic,
                 "Brand vs Generic": bvg_count,
                 "Bioequivalence": bioeq_count,
-                "INN/Brand Ratio": round(inn_count / brand_count, 1) if brand_count > 0 else "N/A",
             })
 
         summary_df = pd.DataFrame(summary_rows)
         st.dataframe(summary_df, width="stretch", hide_index=True)
 
-        # Bar chart: Brand vs INN publication counts
-        st.markdown("#### Publication Counts: Brand vs INN")
-        chart_df = summary_df[["Pair ID", "Brand Pubs", "INN Pubs"]].set_index("Pair ID")
+        # Bar chart: Brand vs Generic vs INN
+        st.markdown("#### Publication Counts: Brands vs INN vs Generic Labs")
+        chart_df = summary_df[["Pair ID", "Total Brand Pubs", "INN Pubs", "Total Generic Pubs"]].set_index("Pair ID")
         st.bar_chart(chart_df)
 
         # Bioequivalence chart
         st.markdown("#### Bioequivalence Studies per Drug")
         bioeq_df = summary_df[["Pair ID", "Bioequivalence"]].set_index("Pair ID")
         st.bar_chart(bioeq_df)
+
+        # ── Per-brand breakdown ──
+        st.markdown("---")
+        st.subheader("Per-Brand Publication Counts")
+        brand_rows = []
+        for r in all_pubmed:
+            for bs in r.get("brand_searches", []):
+                search = bs.get("search")
+                count = search["total_count"] if search else 0
+                brand_rows.append({
+                    "Pair ID": r["pair_id"],
+                    "INN": r["principio_activo"],
+                    "Brand Name": bs["brand_name"],
+                    "Publications": count,
+                })
+        if brand_rows:
+            brand_df = pd.DataFrame(brand_rows)
+            # Show only brands with >0 publications by default
+            show_all_brands = st.checkbox("Show brands with 0 results", value=False, key="show_all_brands")
+            if not show_all_brands:
+                brand_df = brand_df[brand_df["Publications"] > 0]
+            st.dataframe(brand_df, width="stretch", hide_index=True)
+
+        # ── Per-generic-lab breakdown ──
+        st.markdown("---")
+        st.subheader("Per-Generic-Lab Publication Counts")
+        generic_rows = []
+        for r in all_pubmed:
+            for gs in r.get("generic_lab_searches", []):
+                search = gs.get("search")
+                count = search["total_count"] if search else 0
+                generic_rows.append({
+                    "Pair ID": r["pair_id"],
+                    "INN": r["principio_activo"],
+                    "Lab Name": gs["lab_name"],
+                    "Generic Product": gs["generic_product"],
+                    "Publications": count,
+                })
+        if generic_rows:
+            generic_df = pd.DataFrame(generic_rows)
+            show_all_generics = st.checkbox("Show labs with 0 results", value=False, key="show_all_generics")
+            if not show_all_generics:
+                generic_df = generic_df[generic_df["Publications"] > 0]
+            st.dataframe(generic_df, width="stretch", hide_index=True)
+
+            # Top labs by total publications
+            st.markdown("#### Top Generic Labs by Total Publications")
+            lab_totals = generic_df.groupby("Lab Name")["Publications"].sum().sort_values(ascending=False).head(20)
+            st.bar_chart(lab_totals)
 
         # Expandable detail per pair
         st.markdown("---")
@@ -1044,27 +1105,73 @@ elif page == "7. PubMed Literature":
                 f"**{r['pair_id']}** — {r['principio_activo']} ({r['brand_name']})",
                 expanded=False,
             ):
+                # Brand searches
+                st.markdown("##### Brand Name Searches")
+                for bs in r.get("brand_searches", []):
+                    search = bs.get("search")
+                    if not search:
+                        continue
+                    count = search["total_count"]
+                    if count > 0:
+                        st.markdown(f"**{bs['brand_name']}** — {count} results")
+                        st.caption(f"Query: `{search['query']}`")
+                        for art in search.get("articles", []):
+                            authors = ", ".join(art.get("authors", []))
+                            st.markdown(
+                                f"- **{art['title']}** — {art.get('source', '')} "
+                                f"({art.get('pubdate', '')}) {authors}"
+                            )
+
+                # INN search
+                inn_search = r.get("inn_search")
+                if inn_search:
+                    st.markdown("##### INN (Active Ingredient) Search")
+                    st.markdown(f"**{inn_search['total_count']}** results")
+                    st.caption(f"Query: `{inn_search['query']}`")
+                    for art in inn_search.get("articles", []):
+                        authors = ", ".join(art.get("authors", []))
+                        st.markdown(
+                            f"- **{art['title']}** — {art.get('source', '')} "
+                            f"({art.get('pubdate', '')}) {authors}"
+                        )
+
+                # Generic lab searches
+                st.markdown("##### Generic Lab Searches")
+                for gs in r.get("generic_lab_searches", []):
+                    search = gs.get("search")
+                    if not search:
+                        continue
+                    count = search["total_count"]
+                    if count > 0:
+                        st.markdown(
+                            f"**{gs['generic_product']}** ({gs['lab_name']}) "
+                            f"— {count} results"
+                        )
+                        st.caption(f"Query: `{search['query']}`")
+                        for art in search.get("articles", []):
+                            authors = ", ".join(art.get("authors", []))
+                            st.markdown(
+                                f"- **{art['title']}** — {art.get('source', '')} "
+                                f"({art.get('pubdate', '')}) {authors}"
+                            )
+
+                # Comparison searches
                 for search_key, label in [
-                    ("brand_search", "Brand Name Search"),
-                    ("inn_search", "INN (Active Ingredient) Search"),
                     ("brand_vs_generic_search", "Brand vs Generic Comparison"),
                     ("bioequivalence_search", "Bioequivalence Studies"),
                 ]:
                     search = r.get(search_key)
                     if not search:
                         continue
-
-                    st.markdown(f"**{label}** — {search['total_count']} results")
+                    st.markdown(f"##### {label}")
+                    st.markdown(f"**{search['total_count']}** results")
                     st.caption(f"Query: `{search['query']}`")
-
-                    if search.get("articles"):
-                        for art in search["articles"]:
-                            authors = ", ".join(art.get("authors", []))
-                            st.markdown(
-                                f"- **{art['title']}** — {art.get('source', '')} "
-                                f"({art.get('pubdate', '')}) {authors}"
-                            )
-                    st.markdown("")
+                    for art in search.get("articles", []):
+                        authors = ", ".join(art.get("authors", []))
+                        st.markdown(
+                            f"- **{art['title']}** — {art.get('source', '')} "
+                            f"({art.get('pubdate', '')}) {authors}"
+                        )
 
         # Download
         st.markdown("---")

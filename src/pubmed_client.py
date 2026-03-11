@@ -4,6 +4,9 @@ Uses NCBI's E-utilities (esearch + esummary) to query PubMed for each
 drug pair (brand name vs INN/generic) and collect publication counts,
 recent article metadata, and comparative metrics.
 
+Searches ALL known brand names and generic laboratory products for each
+pair, not just the primary brand.
+
 API docs: https://www.ncbi.nlm.nih.gov/books/NBK25500/
 Base URL: https://eutils.ncbi.nlm.nih.gov/entrez/eutils/
 """
@@ -22,6 +25,125 @@ PUBMED_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 PUBMED_DELAY = 0.4  # NCBI allows ~3 req/s without API key; be conservative
 
 
+# ── Extended brand & generic knowledge base ──────────────────────────────────
+# International brand names per INN (superset of drug_pairs.py brands +
+# response_analyzer.py BRAND_NAMES_BY_INN, plus additional worldwide names).
+
+BRAND_NAMES_BY_INN = {
+    "paracetamol": [
+        "gelocatil", "termalgin", "efferalgan", "apiretal", "dolocatil",
+        "panadol", "tylenol", "calpol", "ben-u-ron", "doliprane",
+        "dafalgan", "perfalgan", "panodil", "biogesic", "tempra",
+        "acamol", "febrectal", "lixidol",
+    ],
+    "ibuprofeno": [
+        "nurofen", "espidifen", "dalsy", "dobupal", "bexistar",
+        "neobrufen", "advil", "motrin", "ibufen", "algidol",
+        "brufen", "genpril", "midol", "caldolor", "ibumetin",
+        "spidifen", "junifen", "calprofen",
+    ],
+    "amoxicilina": [
+        "clamoxyl", "amoxicilina beecham", "amoxil", "augmentine",
+        "trimox", "wymox", "moxatag", "larotid", "polymox",
+        "biomox", "dispermox",
+    ],
+    "omeprazol": [
+        "losec", "belfa", "mopral", "mepral", "prilosec",
+        "zegerid", "omepral", "antra", "logastric", "lomac",
+        "gastrimut", "pepticum", "ulceral",
+    ],
+    "atorvastatina": [
+        "lipitor", "cardyl", "zarator", "sortis", "torvast", "totalip",
+        "atoris", "caduet", "tulip", "torvacard", "liprimar",
+    ],
+    "enalapril": [
+        "renitec", "cardiovasil", "dilvas", "acetensil", "naprilene",
+        "vasotec", "enaladex", "envas", "enapren", "baripril",
+    ],
+    "metformina": [
+        "dianben", "glucophage", "fortamet", "glumetza", "riomet",
+        "glycon", "diabex", "glucomin", "metfogamma",
+    ],
+    "lorazepam": [
+        "orfidal", "idalprem", "placinoral",
+        "ativan", "temesta", "tavor", "lorabenz", "anxira",
+    ],
+    "sertralina": [
+        "besitran", "aremis", "zoloft",
+        "lustral", "gladem", "sealdin", "altruline",
+    ],
+    "salbutamol": [
+        "ventolin", "buto asma", "salbulair", "ventolin accuhaler",
+        "proventil", "proair", "airomir", "salamol", "asthalin",
+        "combivent",
+    ],
+    "amlodipino": [
+        "norvasc", "astudal", "neotensin", "istin",
+        "amlopin", "amlor", "amlong", "stamlo",
+    ],
+    "azitromicina": [
+        "zithromax", "vinzam", "toraseptol", "sumamed",
+        "azithral", "zmax", "zitromax", "azibiot",
+    ],
+    "simvastatina": [
+        "zocor", "pantok", "algoren",
+        "simvacor", "simlup", "simvador", "simvor",
+    ],
+    "fluoxetina": [
+        "prozac", "adofen", "reneuron",
+        "sarafem", "rapiflux", "selfemra", "fluoxac",
+    ],
+    "ramipril": [
+        "altace", "acovil", "ramicor", "triatec", "tritace",
+        "ramipro", "cardace", "delix", "pramace", "unipril",
+    ],
+    "diclofenaco": [
+        "voltaren", "artrotec",
+        "cataflam", "zipsor", "zorvolex", "dicloflex", "diclon",
+        "dyloject", "solaraze", "voltarol",
+    ],
+    "pantoprazol": [
+        "pantoc", "anagastra", "pantoloc", "pantecta", "zurcal",
+        "protonix", "controloc", "somac", "pantopan",
+    ],
+    "levotiroxina": [
+        "eutirox", "levothroid", "synthroid", "levothyrox",
+        "eltroxin", "euthyrox", "tirosint", "levoxyl", "unithroid",
+        "oroxine",
+    ],
+    "alprazolam": [
+        "trankimazin", "tranquimazin retard", "xanax",
+        "niravam", "kalma", "alprax", "restyl", "tafil",
+    ],
+    "ciprofloxacino": [
+        "baycip", "rigoran", "ciflosin", "ciproxin", "cetraxal",
+        "cipro", "ciloxan", "ciprobay", "ciplox", "ciproxina",
+    ],
+}
+
+# Extended list of generic pharmaceutical laboratories worldwide
+GENERIC_LABS = [
+    # Major Spanish labs
+    "cinfa", "normon", "kern pharma", "teva", "stada", "mylan",
+    "sandoz", "ratiopharm", "pensa", "alter", "vir", "aurovitas",
+    "zentiva", "aristo", "bluefish", "accord", "sanofi", "ranbaxy",
+    "actavis", "apotex", "biogaran", "davur", "edigen", "farmalider",
+    "gedeon richter", "korhispana", "ratio", "sun pharma", "tecnigen",
+    "winthrop",
+    # Major international labs
+    "dr. reddy's", "dr reddy", "cipla", "lupin", "aurobindo",
+    "torrent", "zydus", "hetero", "glenmark", "macleods",
+    "alkem", "ipca", "biocon", "jubilant", "laurus",
+    "hikma", "endo", "par pharmaceutical", "amneal", "impax",
+    "watson", "barr", "perrigo", "lannett", "cambrex",
+    "fresenius kabi", "hospira", "baxter", "b. braun",
+    "hexal", "1a pharma", "al inde", "basics", "dura",
+    "mepha", "helvepharm", "spirig", "labatec",
+    "eg", "biogaran", "arrow", "cristers", "evolupharm",
+    "rosemont", "tillomed", "milpharm", "kent pharma",
+]
+
+
 @dataclass
 class PubMedSearchResult:
     """Result of a single PubMed search query."""
@@ -32,13 +154,37 @@ class PubMedSearchResult:
 
 
 @dataclass
+class BrandSearchResult:
+    """PubMed search results for a single brand name."""
+    brand_name: str
+    search: Optional[PubMedSearchResult] = None
+
+
+@dataclass
+class GenericLabSearchResult:
+    """PubMed search results for an INN + laboratory combination."""
+    lab_name: str
+    generic_product: str  # e.g. "Omeprazol Cinfa"
+    search: Optional[PubMedSearchResult] = None
+
+
+@dataclass
 class DrugPairPubMedData:
     """PubMed data collected for one drug pair."""
     pair_id: str
     principio_activo: str
     brand_name: str
-    brand_search: Optional[PubMedSearchResult] = None
+    # Per-brand searches (all known brands for this INN)
+    all_brands: list = field(default_factory=list)
+    brand_searches: list = field(default_factory=list)  # list of BrandSearchResult
+    total_brand_pubs: int = 0
+    # INN search (active ingredient)
     inn_search: Optional[PubMedSearchResult] = None
+    # Per-generic-lab searches
+    generic_labs_searched: list = field(default_factory=list)
+    generic_lab_searches: list = field(default_factory=list)  # list of GenericLabSearchResult
+    total_generic_pubs: int = 0
+    # Comparison & bioequivalence
     brand_vs_generic_search: Optional[PubMedSearchResult] = None
     bioequivalence_search: Optional[PubMedSearchResult] = None
 
@@ -177,15 +323,78 @@ class PubMedClient:
         parts = principio_activo.strip().split()
         return parts[0].lower() if parts else principio_activo.lower()
 
+    @staticmethod
+    def _get_all_brands(pair: dict) -> list[str]:
+        """Get all known brand names for a pair.
+
+        Merges pair['brands'] with the extended BRAND_NAMES_BY_INN
+        knowledge base, deduplicating by lowercase.
+        """
+        inn = PubMedClient._extract_inn(pair["principio_activo"])
+        seen = set()
+        brands = []
+
+        # Start with pair-defined brands
+        for b in pair.get("brands", [pair["brand"]]):
+            key = b.lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                brands.append(b)
+
+        # Add from extended knowledge base
+        for b in BRAND_NAMES_BY_INN.get(inn, []):
+            key = b.lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                brands.append(b.title())
+
+        return brands
+
+    @staticmethod
+    def _get_generic_labs(pair: dict) -> list[tuple[str, str]]:
+        """Get generic lab names and product names for a pair.
+
+        Returns list of (lab_name, product_name) tuples.
+        Merges pair['generics'] with the extended GENERIC_LABS list.
+        """
+        inn = PubMedClient._extract_inn(pair["principio_activo"])
+        inn_title = inn.title()
+        seen_labs = set()
+        results = []
+
+        # Start with pair-defined generics (extract lab name from product)
+        for g in pair.get("generics", []):
+            # "Paracetamol Cinfa" -> lab = "cinfa"
+            parts = g.split()
+            if len(parts) >= 2:
+                lab = " ".join(parts[1:])
+            else:
+                lab = g
+            key = lab.lower().strip()
+            if key and key not in seen_labs:
+                seen_labs.add(key)
+                results.append((lab, g))
+
+        # Add major labs not already covered
+        for lab in GENERIC_LABS:
+            key = lab.lower().strip()
+            if key not in seen_labs:
+                seen_labs.add(key)
+                product = f"{inn_title} {lab.title()}"
+                results.append((lab.title(), product))
+
+        return results
+
     def collect_for_pair(self, pair: dict,
                          top_n: int = 5) -> DrugPairPubMedData:
         """Collect PubMed data for a single drug pair.
 
-        Runs four searches per pair:
-        1. Brand name search (e.g. "Losec")
-        2. INN search (e.g. "omeprazol")
-        3. Brand vs generic comparison search
-        4. Bioequivalence search
+        Runs searches for:
+        1. Each known brand name (all brands, not just primary)
+        2. INN (active ingredient)
+        3. Each generic laboratory product (INN + lab name)
+        4. Brand vs generic comparison studies
+        5. Bioequivalence studies
 
         Args:
             pair: Drug pair dict from OFFLINE_PAIRS.
@@ -195,32 +404,61 @@ class PubMedClient:
             DrugPairPubMedData with all search results.
         """
         inn = self._extract_inn(pair["principio_activo"])
-        brand = pair["brand"]
         pair_id = pair["pair_id"]
+
+        all_brands = self._get_all_brands(pair)
+        generic_labs = self._get_generic_labs(pair)
 
         data = DrugPairPubMedData(
             pair_id=pair_id,
             principio_activo=pair["principio_activo"],
-            brand_name=brand,
+            brand_name=pair["brand"],
+            all_brands=[b for b in all_brands],
+            generic_labs_searched=[lab for lab, _ in generic_labs],
         )
 
-        print(f"  [{pair_id}] Searching PubMed for '{brand}' / '{inn}'...")
+        print(f"  [{pair_id}] Searching PubMed for '{inn}'...")
+        print(f"    Brands to search: {len(all_brands)} — "
+              f"Generic labs: {len(generic_labs)}")
 
-        # 1. Brand name
-        data.brand_search = self.search_and_summarise(
-            f'"{brand}"[Title/Abstract] AND drug',
-            top_n=top_n,
-        )
-        print(f"    Brand '{brand}': {data.brand_search.total_count} results")
+        # 1. Per-brand searches
+        total_brand = 0
+        for brand in all_brands:
+            result = self.search_and_summarise(
+                f'"{brand}"[Title/Abstract]',
+                top_n=top_n,
+            )
+            data.brand_searches.append(asdict(
+                BrandSearchResult(brand_name=brand, search=result)
+            ))
+            total_brand += result.total_count
+            print(f"    Brand '{brand}': {result.total_count} results")
+        data.total_brand_pubs = total_brand
 
         # 2. INN (active ingredient)
         data.inn_search = self.search_and_summarise(
-            f'"{inn}"[Title/Abstract] AND drug',
+            f'"{inn}"[Title/Abstract]',
             top_n=top_n,
         )
         print(f"    INN '{inn}': {data.inn_search.total_count} results")
 
-        # 3. Brand vs generic
+        # 3. Per-generic-lab searches
+        total_generic = 0
+        for lab, product in generic_labs:
+            result = self.search_and_summarise(
+                f'"{inn}"[Title/Abstract] AND "{lab}"[Title/Abstract]',
+                top_n=top_n,
+            )
+            data.generic_lab_searches.append(asdict(
+                GenericLabSearchResult(
+                    lab_name=lab, generic_product=product, search=result
+                )
+            ))
+            total_generic += result.total_count
+            print(f"    Generic '{product}': {result.total_count} results")
+        data.total_generic_pubs = total_generic
+
+        # 4. Brand vs generic
         data.brand_vs_generic_search = self.search_and_summarise(
             f'"{inn}"[Title/Abstract] AND (generic OR brand OR branded) '
             f'AND (comparison OR equivalence)',
@@ -229,7 +467,7 @@ class PubMedClient:
         print(f"    Brand-vs-generic: "
               f"{data.brand_vs_generic_search.total_count} results")
 
-        # 4. Bioequivalence
+        # 5. Bioequivalence
         data.bioequivalence_search = self.search_and_summarise(
             f'"{inn}"[Title/Abstract] AND bioequivalence',
             top_n=top_n,

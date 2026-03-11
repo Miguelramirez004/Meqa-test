@@ -34,15 +34,20 @@ def main():
     )
 
     # Print quick summary
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
     print("SUMMARY")
-    print("=" * 60)
+    print("=" * 80)
+    print(f"  {'Pair ID':16s}  {'Brands':>8s}  {'Generic':>8s}  "
+          f"{'INN':>8s}  {'BvG':>6s}  {'Bioeq':>6s}")
+    print("-" * 80)
     for r in results:
-        brand_count = r["brand_search"]["total_count"] if r["brand_search"] else 0
-        inn_count = r["inn_search"]["total_count"] if r["inn_search"] else 0
-        bioeq_count = r["bioequivalence_search"]["total_count"] if r["bioequivalence_search"] else 0
-        print(f"  {r['pair_id']:16s}  brand={brand_count:>6,}  "
-              f"INN={inn_count:>6,}  bioeq={bioeq_count:>5,}")
+        total_brand = r.get("total_brand_pubs", 0)
+        total_generic = r.get("total_generic_pubs", 0)
+        inn_count = r["inn_search"]["total_count"] if r.get("inn_search") else 0
+        bvg_count = r["brand_vs_generic_search"]["total_count"] if r.get("brand_vs_generic_search") else 0
+        bioeq_count = r["bioequivalence_search"]["total_count"] if r.get("bioequivalence_search") else 0
+        print(f"  {r['pair_id']:16s}  {total_brand:>8,}  {total_generic:>8,}  "
+              f"{inn_count:>8,}  {bvg_count:>6,}  {bioeq_count:>6,}")
 
 
 if __name__ == "__main__":
