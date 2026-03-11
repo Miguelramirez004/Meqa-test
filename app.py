@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import (
     DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR,
+    PUBMED_DIR,
 )
 from src.drug_pairs import get_offline_pairs, OFFLINE_PAIRS
 from src.query_generator import generate_queries, save_queries
@@ -27,6 +28,7 @@ from src.commercial_collector import (
     collect_commercial_responses, detect_provider,
     PROVIDER_MODELS, get_all_models,
 )
+from src.pubmed_client import collect_pubmed_for_all_pairs
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -48,9 +50,10 @@ page = st.sidebar.radio(
         "1. Drug Pairs",
         "2. Generate Queries",
         "3. Download Prospectos",
-        "4. Collect Responses",
-        "5. Analyze Responses",
-        "6. Statistical Analysis",
+        "4. PubMed Literature",
+        "5. Collect Responses",
+        "6. Analyze Responses",
+        "7. Statistical Analysis",
     ],
 )
 
@@ -61,7 +64,7 @@ st.sidebar.caption("Doctoral research — GEO asymmetry in MeQA (AEMPS)")
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def ensure_dirs():
-    for d in [DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR]:
+    for d in [DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR, PUBMED_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -248,9 +251,145 @@ elif page == "3. Download Prospectos":
             st.error(f"Error: {e}")
 
 
-# ── Page 4: Collect Responses ────────────────────────────────────────────────
+# ── Page 4: PubMed Literature ────────────────────────────────────────────────
 
-elif page == "4. Collect Responses":
+elif page == "4. PubMed Literature":
+    st.header("PubMed Literature Collection")
+    st.markdown(
+        "Collects published literature from **PubMed** (NCBI) for each drug pair. "
+        "Searches for:\n\n"
+        "1. **General literature** on the active ingredient\n"
+        "2. **Bioequivalence / brand vs generic** studies\n"
+        "3. **Condition-specific** treatment evidence"
+    )
+
+    # Show existing results
+    existing_pubmed = sorted(PUBMED_DIR.glob("*_pubmed.json"))
+    pairs = get_offline_pairs()
+
+    col1, col2 = st.columns(2)
+    col1.metric("Drug Pairs", len(pairs))
+    col2.metric("PubMed Files Collected", len(existing_pubmed))
+
+    if existing_pubmed:
+        st.success(f"**{len(existing_pubmed)}/{len(pairs)}** pairs have PubMed data.")
+
+        # Summary table
+        summary_rows = []
+        for pf in existing_pubmed:
+            with open(pf, encoding="utf-8") as f:
+                pdata = json.load(f)
+            summary_rows.append({
+                "Pair ID": pdata.get("pair_id", pf.stem),
+                "Active Ingredient": pdata.get("principio_activo", ""),
+                "Articles Found": pdata.get("total_found", 0),
+                "Queries Used": len(pdata.get("queries", [])),
+            })
+        st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+
+        # Expandable detail per pair
+        st.markdown("---")
+        st.subheader("Article Details")
+        for pf in existing_pubmed:
+            with open(pf, encoding="utf-8") as f:
+                pdata = json.load(f)
+            pair_id = pdata.get("pair_id", pf.stem)
+            n_articles = pdata.get("total_found", 0)
+            with st.expander(f"**{pair_id}** — {pdata.get('principio_activo', '')} ({n_articles} articles)"):
+                # Show queries used
+                for q in pdata.get("queries", []):
+                    st.caption(f"**{q['label']}**: `{q['query']}` → {q['results']} results")
+
+                # Show articles
+                for art in pdata.get("articles", [])[:10]:
+                    tags = ", ".join(art.get("search_tags", []))
+                    st.markdown(
+                        f"**[PMID {art['pmid']}](https://pubmed.ncbi.nlm.nih.gov/{art['pmid']}/)** "
+                        f"— {art.get('title', 'No title')}"
+                    )
+                    st.caption(
+                        f"{art.get('journal', '')} ({art.get('year', 'N/A')}) "
+                        f"| Tags: {tags}"
+                    )
+                    if art.get("abstract"):
+                        st.text(art["abstract"][:300] + ("..." if len(art.get("abstract", "")) > 300 else ""))
+                    st.markdown("---")
+
+                if n_articles > 10:
+                    st.caption(f"Showing first 10 of {n_articles} articles.")
+
+        # Download all
+        st.markdown("---")
+        all_pubmed_data = []
+        for pf in existing_pubmed:
+            with open(pf, encoding="utf-8") as f:
+                all_pubmed_data.append(json.load(f))
+        json_bytes = json.dumps(all_pubmed_data, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button(
+            "Download All PubMed Data (JSON)",
+            json_bytes,
+            "pubmed_all_pairs.json",
+            "application/json",
+        )
+
+    st.markdown("---")
+
+    # Collection controls
+    st.subheader("Collect from PubMed")
+
+    col_cfg1, col_cfg2 = st.columns(2)
+    with col_cfg1:
+        pubmed_api_key = st.text_input(
+            "NCBI API Key (optional)",
+            type="password",
+            help="Get one at https://www.ncbi.nlm.nih.gov/account/settings/ — "
+                 "increases rate limit from 3/s to 10/s. Leave blank for unauthenticated access.",
+        )
+    with col_cfg2:
+        pubmed_max = st.slider(
+            "Max articles per query", 5, 50, 20,
+            help="Number of articles to retrieve per search query.",
+        )
+
+    skip_existing_pubmed = st.checkbox("Skip pairs with existing data", value=True)
+
+    if st.button("Collect PubMed Literature", type="primary"):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def update_pubmed_progress(current, total):
+            progress_bar.progress(current / total)
+            pair_name = pairs[current - 1]["principio_activo"] if current <= len(pairs) else ""
+            status_text.text(f"Pair {current}/{total} — {pair_name}")
+
+        try:
+            status_text.text("Connecting to PubMed (NCBI E-utilities)...")
+            results = collect_pubmed_for_all_pairs(
+                drug_pairs=pairs,
+                output_dir=PUBMED_DIR,
+                api_key=pubmed_api_key,
+                max_results=pubmed_max,
+                skip_existing=skip_existing_pubmed,
+                progress_callback=update_pubmed_progress,
+            )
+            progress_bar.empty()
+            status_text.empty()
+
+            total_articles = sum(r.get("total_found", 0) for r in results)
+            st.success(
+                f"Collected literature for **{len(results)}** drug pairs. "
+                f"Total articles: **{total_articles}**"
+            )
+            st.rerun()
+        except Exception as e:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(f"Error during PubMed collection: {e}")
+
+
+# ── Page 5: Collect Responses ────────────────────────────────────────────────
+
+elif page == "5. Collect Responses":
     st.header("Collect Responses")
     st.markdown(
         "Send queries to AI models and collect responses. Choose between "
@@ -592,9 +731,9 @@ elif page == "4. Collect Responses":
             st.caption(f"Showing first 20 of {resp_count} responses.")
 
 
-# ── Page 5: Analyze Responses ────────────────────────────────────────────────
+# ── Page 6: Analyze Responses ────────────────────────────────────────────────
 
-elif page == "5. Analyze Responses":
+elif page == "6. Analyze Responses":
     st.header("Analyze Responses (Drug Mention Audit)")
     st.markdown(
         "Codes each response with **broad drug name recognition**:\n\n"
@@ -608,7 +747,7 @@ elif page == "5. Analyze Responses":
     metrics_df = load_metrics_df()
 
     if resp_count == 0:
-        st.warning("No responses found. Go to **Step 4** to upload MeQA responses first.")
+        st.warning("No responses found. Go to **Step 5** to upload MeQA responses first.")
     else:
         st.info(f"**{resp_count}** responses available for analysis.")
 
@@ -733,9 +872,9 @@ elif page == "5. Analyze Responses":
         st.download_button("Download Metrics CSV", csv_data, "response_metrics.csv", "text/csv")
 
 
-# ── Page 6: Statistical Analysis ─────────────────────────────────────────────
+# ── Page 7: Statistical Analysis ─────────────────────────────────────────────
 
-elif page == "6. Statistical Analysis":
+elif page == "7. Statistical Analysis":
     st.header("Statistical Hypothesis Testing")
     st.markdown(
         "Non-parametric tests for drug mention asymmetry between "
@@ -745,7 +884,7 @@ elif page == "6. Statistical Analysis":
     metrics_df = load_metrics_df()
 
     if metrics_df is None:
-        st.warning("No coded metrics found. Run **Step 5** first.")
+        st.warning("No coded metrics found. Run **Step 6** first.")
     else:
         st.info(f"Loaded **{len(metrics_df)}** coded responses.")
 
@@ -884,7 +1023,7 @@ elif page == "6. Statistical Analysis":
 
                 st.bar_chart(asym_df.set_index("pair_id")["composite_asymmetry_score"])
             else:
-                st.warning("No asymmetry scores found. Run **Step 5** first.")
+                st.warning("No asymmetry scores found. Run **Step 6** first.")
 
         # ── Summary ──
         with tabs[5]:
