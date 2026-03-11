@@ -376,10 +376,21 @@ elif page == "4. PubMed Literature":
             status_text.empty()
 
             total_articles = sum(r.get("total_found", 0) for r in results)
+            pair_errors = [r for r in results if r.get("error")]
             st.success(
                 f"Collected literature for **{len(results)}** drug pairs. "
                 f"Total articles: **{total_articles}**"
             )
+            if pair_errors:
+                st.warning(
+                    f"**{len(pair_errors)}** pairs had errors: "
+                    + ", ".join(f"{r['pair_id']}: {r['error']}" for r in pair_errors[:5])
+                )
+            if total_articles == 0 and not pair_errors:
+                st.info(
+                    "No articles found. If you have an NCBI API key, enter it above. "
+                    "Also check your Streamlit Cloud logs for detailed error messages."
+                )
             st.rerun()
         except Exception as e:
             progress_bar.empty()

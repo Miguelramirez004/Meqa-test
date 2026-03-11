@@ -8,19 +8,26 @@ API docs: https://www.ncbi.nlm.nih.gov/books/NBK25500/
 Base URL: https://eutils.ncbi.nlm.nih.gov/entrez/eutils/
 """
 
+import logging
 import time
 import json
 import requests
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-
 from typing import Callable, Optional
 
 from .config import DATA_DIR, PUBMED_DIR, API_DELAY
 
 
+log = logging.getLogger(__name__)
+
 PUBMED_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 PUBMED_DELAY = 0.4  # NCBI allows ~3 req/s without API key; be conservative
+
+# NCBI requires tool + email for identification (may block without them)
+# See: https://www.ncbi.nlm.nih.gov/books/NBK25497/
+NCBI_TOOL = "MeQA-Research"
+NCBI_EMAIL = "meqa.research@example.com"
 
 
 @dataclass
@@ -30,6 +37,7 @@ class PubMedSearchResult:
     total_count: int = 0
     article_ids: list = field(default_factory=list)
     articles: list = field(default_factory=list)  # summaries for top N
+    error: str = ""
 
 
 @dataclass
@@ -51,118 +59,130 @@ class PubMedClient:
     Rate-limited to respect NCBI's usage policies.
     """
 
-    def __init__(self, api_key: str = None, delay: float = PUBMED_DELAY,
-                 timeout: int = 30):
-        """Initialise the client.
-
-        Args:
-            api_key: Optional NCBI API key (raises rate limit to 10 req/s).
-            delay: Seconds between requests.
-            timeout: HTTP timeout in seconds.
-        """
+    def __init__(self, api_key: str = None, email: str = NCBI_EMAIL,
+                 tool: str = NCBI_TOOL, delay: float = PUBMED_DELAY,
+                 timeout: int = 30, retries: int = 2):
         self.base_url = PUBMED_BASE_URL
-        self.api_key = api_key
-        self.delay = delay
+        self.api_key = api_key.strip() if api_key else None
+        self.email = email
+        self.tool = tool
+        self.delay = delay if not api_key else 0.12  # 10/s with key
         self.timeout = timeout
+        self.retries = retries
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "MeQA-Research/1.0 (Academic Thesis)",
+            "User-Agent": f"{tool}/1.0 ({email})",
         })
 
     def _base_params(self) -> dict:
-        """Common params for all E-utility requests."""
-        params = {"retmode": "json"}
+        """Common params for all E-utility requests (NCBI-required)."""
+        params = {
+            "retmode": "json",
+            "tool": self.tool,
+            "email": self.email,
+        }
         if self.api_key:
             params["api_key"] = self.api_key
         return params
 
+    def _get_with_retry(self, url: str, params: dict) -> requests.Response:
+        """GET with retry and rate-limit delay."""
+        last_exc = None
+        for attempt in range(self.retries + 1):
+            time.sleep(self.delay)
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                return resp
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                log.warning("Attempt %d/%d failed for %s: %s",
+                            attempt + 1, self.retries + 1, url, e)
+                if attempt < self.retries:
+                    time.sleep(2 ** attempt)  # exponential backoff
+        raise last_exc
+
     def esearch(self, query: str, db: str = "pubmed",
                 retmax: int = 20) -> dict | None:
-        """Search PubMed and return matching article IDs.
-
-        Args:
-            query: PubMed search query string.
-            db: NCBI database (default: pubmed).
-            retmax: Maximum number of IDs to return.
-
-        Returns:
-            Parsed JSON response or None on error.
-        """
+        """Search PubMed and return matching article IDs."""
         url = f"{self.base_url}/esearch.fcgi"
         params = {**self._base_params(), "db": db, "term": query,
-                  "retmax": retmax, "usehistory": "y"}
-        time.sleep(self.delay)
+                  "retmax": retmax}
         try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            return resp.json()
+            resp = self._get_with_retry(url, params)
+            data = resp.json()
+            # Check for NCBI-level errors
+            if "esearchresult" in data:
+                err = data["esearchresult"].get("ERROR")
+                if err:
+                    log.error("NCBI esearch error for '%s': %s", query, err)
+                    return None
+            return data
         except requests.exceptions.RequestException as e:
-            print(f"  [ERROR] esearch '{query}': {e}")
+            log.error("esearch failed for '%s': %s", query, e)
+            return None
+        except ValueError as e:
+            log.error("esearch JSON parse error for '%s': %s", query, e)
             return None
 
     def esummary(self, ids: list[str], db: str = "pubmed") -> dict | None:
-        """Fetch article summaries for a list of PubMed IDs.
-
-        Args:
-            ids: List of PubMed article IDs.
-            db: NCBI database.
-
-        Returns:
-            Parsed JSON response or None on error.
-        """
+        """Fetch article summaries for a list of PubMed IDs."""
         if not ids:
             return None
         url = f"{self.base_url}/esummary.fcgi"
         params = {**self._base_params(), "db": db,
-                  "id": ",".join(str(i) for i in ids)}
-        time.sleep(self.delay)
+                  "id": ",".join(str(i) for i in ids),
+                  "version": "2.0"}
         try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
+            resp = self._get_with_retry(url, params)
             return resp.json()
         except requests.exceptions.RequestException as e:
-            print(f"  [ERROR] esummary: {e}")
+            log.error("esummary failed: %s", e)
+            return None
+        except ValueError as e:
+            log.error("esummary JSON parse error: %s", e)
             return None
 
     def search_and_summarise(self, query: str,
                              top_n: int = 5) -> PubMedSearchResult:
-        """Search PubMed and return count + top N article summaries.
-
-        Args:
-            query: PubMed search string.
-            top_n: How many article summaries to fetch.
-
-        Returns:
-            PubMedSearchResult with counts and article metadata.
-        """
+        """Search PubMed and return count + top N article summaries."""
         result = PubMedSearchResult(query=query)
 
         # Step 1: search
         search_data = self.esearch(query, retmax=top_n)
         if not search_data or "esearchresult" not in search_data:
+            result.error = "esearch returned no data"
             return result
 
         esearch = search_data["esearchresult"]
         result.total_count = int(esearch.get("count", 0))
         result.article_ids = esearch.get("idlist", [])
 
+        if not result.article_ids:
+            return result
+
         # Step 2: fetch summaries for top N
-        if result.article_ids:
-            summary_data = self.esummary(result.article_ids[:top_n])
-            if summary_data and "result" in summary_data:
-                for aid in result.article_ids[:top_n]:
-                    article = summary_data["result"].get(str(aid))
-                    if article:
-                        result.articles.append({
-                            "pmid": aid,
-                            "title": article.get("title", ""),
-                            "pubdate": article.get("pubdate", ""),
-                            "source": article.get("source", ""),
-                            "authors": [
-                                a.get("name", "")
-                                for a in article.get("authors", [])[:3]
-                            ],
-                        })
+        summary_data = self.esummary(result.article_ids[:top_n])
+        if not summary_data or "result" not in summary_data:
+            result.error = "esummary returned no data"
+            return result
+
+        for aid in result.article_ids[:top_n]:
+            article = summary_data["result"].get(str(aid))
+            if not article or "error" in article:
+                continue
+            result.articles.append({
+                "pmid": aid,
+                "title": article.get("title", ""),
+                "pubdate": article.get("pubdate",
+                           article.get("sortpubdate", "")),
+                "source": article.get("source",
+                          article.get("fulljournalname", "")),
+                "authors": [
+                    a.get("name", "")
+                    for a in article.get("authors", [])[:5]
+                ],
+            })
 
         return result
 
@@ -187,13 +207,6 @@ class PubMedClient:
         2. INN search (e.g. "omeprazol")
         3. Brand vs generic comparison search
         4. Bioequivalence search
-
-        Args:
-            pair: Drug pair dict from OFFLINE_PAIRS.
-            top_n: Number of article summaries per search.
-
-        Returns:
-            DrugPairPubMedData with all search results.
         """
         inn = self._extract_inn(pair["principio_activo"])
         brand = pair["brand"]
@@ -205,38 +218,38 @@ class PubMedClient:
             brand_name=brand,
         )
 
-        print(f"  [{pair_id}] Searching PubMed for '{brand}' / '{inn}'...")
+        log.info("[%s] Searching PubMed for '%s' / '%s'...", pair_id, brand, inn)
 
-        # 1. Brand name
+        # 1. Brand name — use simple term (no field tag) for broader matching
         data.brand_search = self.search_and_summarise(
-            f'"{brand}"[Title/Abstract] AND drug',
+            f'{brand} AND drug',
             top_n=top_n,
         )
-        print(f"    Brand '{brand}': {data.brand_search.total_count} results")
+        log.info("  Brand '%s': %d results", brand, data.brand_search.total_count)
 
-        # 2. INN (active ingredient)
+        # 2. INN (active ingredient) — broader search without field restriction
         data.inn_search = self.search_and_summarise(
-            f'"{inn}"[Title/Abstract] AND drug',
+            f'{inn}[Title/Abstract]',
             top_n=top_n,
         )
-        print(f"    INN '{inn}': {data.inn_search.total_count} results")
+        log.info("  INN '%s': %d results", inn, data.inn_search.total_count)
 
         # 3. Brand vs generic
         data.brand_vs_generic_search = self.search_and_summarise(
-            f'"{inn}"[Title/Abstract] AND (generic OR brand OR branded) '
+            f'{inn}[Title/Abstract] AND (generic OR brand OR branded) '
             f'AND (comparison OR equivalence)',
             top_n=top_n,
         )
-        print(f"    Brand-vs-generic: "
-              f"{data.brand_vs_generic_search.total_count} results")
+        log.info("  Brand-vs-generic: %d results",
+                 data.brand_vs_generic_search.total_count)
 
         # 4. Bioequivalence
         data.bioequivalence_search = self.search_and_summarise(
-            f'"{inn}"[Title/Abstract] AND bioequivalence',
+            f'{inn}[Title/Abstract] AND bioequivalence',
             top_n=top_n,
         )
-        print(f"    Bioequivalence: "
-              f"{data.bioequivalence_search.total_count} results")
+        log.info("  Bioequivalence: %d results",
+                 data.bioequivalence_search.total_count)
 
         return data
 
@@ -244,17 +257,7 @@ class PubMedClient:
 def collect_pubmed_data(pairs: list[dict], api_key: str = None,
                         top_n: int = 5,
                         output_dir: Path = None) -> list[dict]:
-    """Collect PubMed data for all drug pairs and save to JSON.
-
-    Args:
-        pairs: List of drug pair dicts (from OFFLINE_PAIRS).
-        api_key: Optional NCBI API key.
-        top_n: Article summaries per search.
-        output_dir: Where to save output (default: data/pubmed/).
-
-    Returns:
-        List of serialised DrugPairPubMedData dicts.
-    """
+    """Collect PubMed data for all drug pairs and save to JSON."""
     if output_dir is None:
         output_dir = DATA_DIR / "pubmed"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -262,7 +265,7 @@ def collect_pubmed_data(pairs: list[dict], api_key: str = None,
     client = PubMedClient(api_key=api_key)
     results = []
 
-    print(f"Collecting PubMed data for {len(pairs)} drug pairs...")
+    log.info("Collecting PubMed data for %d drug pairs...", len(pairs))
     for pair in pairs:
         pair_data = client.collect_for_pair(pair, top_n=top_n)
         serialised = asdict(pair_data)
@@ -278,7 +281,7 @@ def collect_pubmed_data(pairs: list[dict], api_key: str = None,
     with open(combined_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    print(f"\nDone. Saved {len(results)} pair results to {output_dir}/")
+    log.info("Done. Saved %d pair results to %s/", len(results), output_dir)
     return results
 
 
@@ -286,6 +289,7 @@ def collect_pubmed_for_all_pairs(
     drug_pairs: list[dict],
     output_dir: Path = PUBMED_DIR,
     api_key: str = "",
+    email: str = NCBI_EMAIL,
     max_results: int = 5,
     skip_existing: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -296,9 +300,14 @@ def collect_pubmed_for_all_pairs(
     format compatible with the Streamlit UI (keys: total_found, queries, articles).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    client = PubMedClient(api_key=api_key or None)
+    client = PubMedClient(api_key=api_key.strip() or None, email=email)
+
+    # Logging visible in Streamlit logs
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(message)s")
+
     results = []
     total = len(drug_pairs)
+    errors = []
 
     for i, pair in enumerate(drug_pairs):
         pair_id = pair["pair_id"]
@@ -312,45 +321,63 @@ def collect_pubmed_for_all_pairs(
                 progress_callback(i + 1, total)
             continue
 
-        # Collect via the existing client method
-        pair_data = client.collect_for_pair(pair, top_n=max_results)
-        serialised = asdict(pair_data)
+        try:
+            # Collect via the existing client method
+            pair_data = client.collect_for_pair(pair, top_n=max_results)
+            serialised = asdict(pair_data)
 
-        # Build the UI-friendly dict with total_found / queries / articles
-        all_articles = []
-        queries_used = []
-        for search_key, label in [
-            ("brand_search", "brand"),
-            ("inn_search", "inn"),
-            ("brand_vs_generic_search", "brand_vs_generic"),
-            ("bioequivalence_search", "bioequivalence"),
-        ]:
-            search = serialised.get(search_key)
-            if search:
-                queries_used.append({
-                    "label": label,
-                    "query": search.get("query", ""),
-                    "results": search.get("total_count", 0),
-                })
-                for art in search.get("articles", []):
-                    art.setdefault("search_tags", []).append(label)
-                    if not any(a["pmid"] == art["pmid"] for a in all_articles):
-                        all_articles.append(art)
+            # Build the UI-friendly dict with total_found / queries / articles
+            all_articles = []
+            queries_used = []
+            for search_key, label in [
+                ("brand_search", "brand"),
+                ("inn_search", "inn"),
+                ("brand_vs_generic_search", "brand_vs_generic"),
+                ("bioequivalence_search", "bioequivalence"),
+            ]:
+                search = serialised.get(search_key)
+                if search:
+                    queries_used.append({
+                        "label": label,
+                        "query": search.get("query", ""),
+                        "results": search.get("total_count", 0),
+                        "error": search.get("error", ""),
+                    })
+                    for art in search.get("articles", []):
+                        art.setdefault("search_tags", []).append(label)
+                        if not any(a["pmid"] == art["pmid"] for a in all_articles):
+                            all_articles.append(art)
 
-        result = {
-            **serialised,
-            "condition": pair.get("condition", ""),
-            "queries": queries_used,
-            "articles": all_articles,
-            "total_found": len(all_articles),
-        }
+            result = {
+                **serialised,
+                "condition": pair.get("condition", ""),
+                "queries": queries_used,
+                "articles": all_articles,
+                "total_found": len(all_articles),
+            }
 
-        with open(out_file, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
 
-        results.append(result)
+            results.append(result)
+
+        except Exception as e:
+            log.error("Failed to collect for %s: %s", pair_id, e)
+            errors.append(f"{pair_id}: {e}")
+            results.append({
+                "pair_id": pair_id,
+                "principio_activo": pair.get("principio_activo", ""),
+                "condition": pair.get("condition", ""),
+                "queries": [],
+                "articles": [],
+                "total_found": 0,
+                "error": str(e),
+            })
 
         if progress_callback:
             progress_callback(i + 1, total)
+
+    if errors:
+        log.warning("Errors during collection: %s", "; ".join(errors))
 
     return results
