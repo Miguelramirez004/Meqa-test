@@ -13,9 +13,10 @@ import json
 import requests
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
-from .config import DATA_DIR, API_DELAY
+from typing import Callable, Optional
+
+from .config import DATA_DIR, PUBMED_DIR, API_DELAY
 
 
 PUBMED_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -278,4 +279,78 @@ def collect_pubmed_data(pairs: list[dict], api_key: str = None,
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     print(f"\nDone. Saved {len(results)} pair results to {output_dir}/")
+    return results
+
+
+def collect_pubmed_for_all_pairs(
+    drug_pairs: list[dict],
+    output_dir: Path = PUBMED_DIR,
+    api_key: str = "",
+    max_results: int = 5,
+    skip_existing: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict]:
+    """Collect PubMed literature for all drug pairs (Streamlit-compatible wrapper).
+
+    Wraps PubMedClient with skip_existing, progress_callback, and a return
+    format compatible with the Streamlit UI (keys: total_found, queries, articles).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    client = PubMedClient(api_key=api_key or None)
+    results = []
+    total = len(drug_pairs)
+
+    for i, pair in enumerate(drug_pairs):
+        pair_id = pair["pair_id"]
+        out_file = output_dir / f"{pair_id}_pubmed.json"
+
+        # Skip if already collected
+        if skip_existing and out_file.exists():
+            with open(out_file, encoding="utf-8") as f:
+                results.append(json.load(f))
+            if progress_callback:
+                progress_callback(i + 1, total)
+            continue
+
+        # Collect via the existing client method
+        pair_data = client.collect_for_pair(pair, top_n=max_results)
+        serialised = asdict(pair_data)
+
+        # Build the UI-friendly dict with total_found / queries / articles
+        all_articles = []
+        queries_used = []
+        for search_key, label in [
+            ("brand_search", "brand"),
+            ("inn_search", "inn"),
+            ("brand_vs_generic_search", "brand_vs_generic"),
+            ("bioequivalence_search", "bioequivalence"),
+        ]:
+            search = serialised.get(search_key)
+            if search:
+                queries_used.append({
+                    "label": label,
+                    "query": search.get("query", ""),
+                    "results": search.get("total_count", 0),
+                })
+                for art in search.get("articles", []):
+                    art.setdefault("search_tags", []).append(label)
+                    if not any(a["pmid"] == art["pmid"] for a in all_articles):
+                        all_articles.append(art)
+
+        result = {
+            **serialised,
+            "condition": pair.get("condition", ""),
+            "queries": queries_used,
+            "articles": all_articles,
+            "total_found": len(all_articles),
+        }
+
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+        results.append(result)
+
+        if progress_callback:
+            progress_callback(i + 1, total)
+
     return results
