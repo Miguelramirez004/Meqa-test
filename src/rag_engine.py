@@ -208,30 +208,60 @@ def generate_response(
 def _extract_drugs_from_queries(queries: list[dict]) -> list[dict]:
     """Extract unique (pair_id, drug_name, is_generic) from queries.
 
-    Skips comparative queries (those have compound drug names like 'A vs B').
-    Returns a list of drug dicts suitable for the pipeline config.
+    Handles two query formats:
+      - Old format: each query has a specific drug_name + is_generic bool
+      - New "open" format: drug_name is empty; brand_names/generic_names lists present
+
+    Returns a list of drug dicts suitable for the bootstrap pipeline.
     """
     seen = set()
     drugs = []
 
     for q in queries:
         is_generic = q.get("is_generic", "")
-        # Skip comparative queries — they reference two drugs
-        if is_generic == "comparative" or " vs " in q.get("drug_name", ""):
+        pair_id = q.get("pair_id", "")
+        principio = q.get("principio_activo", "")
+
+        # ── Old format: query has a specific drug_name ──
+        drug_name = q.get("drug_name", "")
+        if drug_name and is_generic != "comparative" and " vs " not in drug_name:
+            key = (pair_id, drug_name)
+            if key not in seen:
+                seen.add(key)
+                drugs.append({
+                    "pair_id": pair_id,
+                    "drug_name": drug_name,
+                    "is_generic": is_generic is True or is_generic == "True",
+                    "principio_activo": principio,
+                })
             continue
 
-        pair_id = q.get("pair_id", "")
-        drug_name = q.get("drug_name", "")
-        key = (pair_id, drug_name)
+        # ── New "open" format: extract from brand_names / generic_names ──
+        for name in q.get("brand_names", []):
+            if isinstance(name, dict):
+                name = name.get("nombre", "")
+            key = (pair_id, name)
+            if name and key not in seen:
+                seen.add(key)
+                drugs.append({
+                    "pair_id": pair_id,
+                    "drug_name": name,
+                    "is_generic": False,
+                    "principio_activo": principio,
+                })
 
-        if key not in seen and drug_name:
-            seen.add(key)
-            drugs.append({
-                "pair_id": pair_id,
-                "drug_name": drug_name,
-                "is_generic": bool(is_generic),
-                "principio_activo": q.get("principio_activo", ""),
-            })
+        for name in q.get("generic_names", []):
+            if isinstance(name, dict):
+                name = name.get("nombre", "")
+            key = (pair_id, name)
+            if name and key not in seen:
+                seen.add(key)
+                drugs.append({
+                    "pair_id": pair_id,
+                    "drug_name": name,
+                    "is_generic": True,
+                    "principio_activo": principio,
+                })
 
     return drugs
 
@@ -262,24 +292,34 @@ def _try_load_prospecto_json(drug_name: str,
                              prospectos_dir: Path = PROSPECTOS_DIR) -> dict | None:
     """Try to find a matching prospecto JSON in data/prospectos/.
 
+    Matches by exact name first, then by prefix/substring (handles short
+    brand names like "Gelocatil" matching "GELOCATIL 650 MG COMPRIMIDOS").
+
     Returns the parsed JSON if found, None otherwise.
     """
     if not prospectos_dir.exists():
         return None
 
-    # Search through existing files
+    name_upper = drug_name.upper()
+    best_match = None
+
     for fp in prospectos_dir.glob("*.json"):
         if fp.name == ".gitkeep":
             continue
         try:
             with open(fp, encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("nombre", "").upper() == drug_name.upper():
+            nombre = data.get("nombre", "").upper()
+            # Exact match — return immediately
+            if nombre == name_upper:
                 return data
+            # Prefix match (e.g. "Gelocatil" matches "GELOCATIL 650 MG ...")
+            if nombre.startswith(name_upper + " ") or name_upper.startswith(nombre + " "):
+                best_match = data
         except (json.JSONDecodeError, KeyError):
             continue
 
-    return None
+    return best_match
 
 
 def _chunk_prospecto_json(
