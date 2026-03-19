@@ -25,8 +25,8 @@ COLLECTION_NAME = "meqa_leaflets"
 class MeQAVectorStore:
     """ChromaDB-based vector store for MEQa leaflet chunks."""
 
-    def __init__(self, chroma_dir: Path = CHROMA_DIR):
-        self.chroma_dir = chroma_dir
+    def __init__(self, chroma_dir: Path | str = CHROMA_DIR):
+        self.chroma_dir = Path(chroma_dir)
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
         self._embedding_fn = DefaultEmbeddingFunction()
         self._client = chromadb.PersistentClient(
