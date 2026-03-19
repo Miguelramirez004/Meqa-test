@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import (
     DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR,
-    PUBMED_DIR,
+    PUBMED_DIR, LEAFLETS_DIR, CHROMA_DIR,
 )
 from src.drug_pairs import get_offline_pairs, OFFLINE_PAIRS
 from src.query_generator import generate_queries, save_queries
@@ -519,17 +519,18 @@ elif page == "5. Collect Responses":
                     st.error(f"Error during commercial collection: {e}")
 
     # ══════════════════════════════════════════════════════════════
-    # RAG PIPELINE — Prospectos + LLM
+    # RAG PIPELINE — CIMA Leaflets + ChromaDB + LLM
     # ══════════════════════════════════════════════════════════════
     else:
         st.subheader("MeQA RAG Pipeline Collection")
         st.markdown(
-            "Simulates the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
-            "(AEMPS, Santamaría 2021) using LangChain:\n\n"
+            "Adapts the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
+            "(AEMPS, Santamaría 2021) using modern dense retrieval:\n\n"
             "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
-            "**Block 2** — Hybrid Retrieval: BM25 (sparse, like TF-IDF) + FAISS (dense) "
-            "with section-aware filtering\n\n"
-            "**Block 3** — Answer Extraction: context assembly + LLM generation"
+            "**Block 2** — Dense Retrieval: `paraphrase-multilingual-MiniLM-L12-v2` "
+            "embeddings + ChromaDB cosine similarity with metadata filtering\n\n"
+            "**Block 3** — Answer Generation: LLM grounded in retrieved chunks with "
+            "section context (MEQa's 'context addition')"
         )
 
         api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
@@ -540,9 +541,23 @@ elif page == "5. Collect Responses":
                 help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
             )
 
-        prospecto_count = len(list(PROSPECTOS_DIR.glob("*.json"))) - (
-            1 if (PROSPECTOS_DIR / ".gitkeep").exists() else 0
-        )
+        # Check ChromaDB index status
+        chroma_count = 0
+        try:
+            from src.vector_store import MeQAVectorStore
+            _store = MeQAVectorStore(chroma_dir=CHROMA_DIR)
+            chroma_count = _store.count
+        except Exception:
+            pass
+
+        # Check leaflets status
+        leaflet_count = 0
+        if LEAFLETS_DIR.exists():
+            leaflet_count = len(list(LEAFLETS_DIR.glob("**/*.html")))
+
+        # Check nregistro config
+        nregistro_config = PAIRS_DIR / "drug_pairs_nregistro.json"
+        has_nregistro = nregistro_config.exists()
 
         col_cfg1, col_cfg2 = st.columns(2)
         with col_cfg1:
@@ -553,28 +568,100 @@ elif page == "5. Collect Responses":
                 help="gpt-4o-mini is recommended (fast and cost-effective).",
             )
             top_k = st.slider(
-                "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=12,
+                "Chunks to retrieve (top-k)", min_value=1, max_value=20, value=5,
                 help="Number of prospecto chunks fed as context to the LLM.",
             )
         with col_cfg2:
-            chunk_size = st.selectbox(
-                "Chunk size (chars)", [300, 500, 600, 750, 1000], index=2,
-                help="Smaller chunks = more precise retrieval; larger = more context.",
-            )
-            bm25_weight = st.slider(
-                "BM25 weight (sparse vs dense)", 0.0, 1.0, 0.4, 0.1,
-                help="0.0 = dense only (FAISS), 1.0 = sparse only (BM25). "
-                     "0.4 recommended (like MeQA's TF-IDF + VSM/LSI blend).",
-            )
+            st.metric("ChromaDB Chunks Indexed", chroma_count)
+            st.metric("Leaflet HTML Files", leaflet_count)
 
-        if prospecto_count > 0:
-            st.info(f"**{prospecto_count}** prospectos available as RAG context.")
+        # Status indicators
+        if chroma_count > 0:
+            st.success(f"**{chroma_count}** chunks indexed in ChromaDB. Ready for retrieval.")
+        elif leaflet_count > 0:
+            st.warning(
+                f"**{leaflet_count}** leaflet HTML files found but not indexed. "
+                "Click **Index Leaflets into ChromaDB** below."
+            )
         else:
             st.warning(
-                "No prospectos downloaded yet. The model will answer from general "
-                "pharmaceutical knowledge. For better results, run **Step 3** first."
+                "No leaflets fetched yet. Use **Fetch Leaflets from CIMA** below, "
+                "or run **Step 3** to download prospectos first."
             )
 
+        st.markdown("---")
+
+        # ── Leaflet Fetch & Index controls ──
+        st.subheader("Leaflet Management")
+
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            if has_nregistro:
+                if st.button("Fetch Leaflets from CIMA", type="secondary"):
+                    try:
+                        from src.cima_leaflet_fetcher import fetch_all_leaflets
+                        with open(nregistro_config, encoding="utf-8") as f:
+                            pairs_config = json.load(f)
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+
+                        def update_fetch(current, total):
+                            progress_bar.progress(current / total)
+                            status_text.text(f"Fetching leaflet {current}/{total}...")
+
+                        status_text.text("Fetching leaflet sections from CIMA...")
+                        fetch_all_leaflets(
+                            drug_pairs=pairs_config,
+                            leaflets_dir=LEAFLETS_DIR,
+                            skip_existing=True,
+                            progress_callback=update_fetch,
+                        )
+                        progress_bar.empty()
+                        status_text.empty()
+                        st.success("Leaflets fetched from CIMA.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error fetching leaflets: {e}")
+            else:
+                st.info(
+                    "Run `python scripts/lookup_nregistro.py --save` first to create "
+                    "the drug pairs config with nregistro values."
+                )
+
+        with col_f2:
+            if leaflet_count > 0 or has_nregistro:
+                if st.button("Index Leaflets into ChromaDB", type="secondary"):
+                    try:
+                        from src.leaflet_chunker import chunk_all_leaflets
+                        from src.vector_store import MeQAVectorStore
+
+                        with open(nregistro_config, encoding="utf-8") as f:
+                            pairs_config = json.load(f)
+
+                        status_text = st.empty()
+                        status_text.text("Chunking leaflets...")
+                        chunks = chunk_all_leaflets(
+                            drug_pairs=pairs_config,
+                            leaflets_dir=LEAFLETS_DIR,
+                        )
+
+                        if chunks:
+                            status_text.text(f"Indexing {len(chunks)} chunks into ChromaDB...")
+                            store = MeQAVectorStore(chroma_dir=CHROMA_DIR)
+                            store.clear()
+                            indexed = store.index_chunks(chunks)
+                            status_text.empty()
+                            st.success(f"Indexed **{indexed}** chunks into ChromaDB.")
+                            st.rerun()
+                        else:
+                            status_text.empty()
+                            st.warning("No chunks produced. Check that leaflets are fetched.")
+                    except Exception as e:
+                        st.error(f"Error indexing leaflets: {e}")
+
+        st.markdown("---")
+
+        # ── Run RAG Collection ──
         if not api_key:
             st.info("Enter your OpenAI API key above to enable automated collection.")
         elif total_queries == 0:
@@ -593,17 +680,13 @@ elif page == "5. Collect Responses":
                     status_text.text(f"Processing query {current}/{total}...")
 
                 try:
-                    status_text.text("Building hybrid retriever (BM25 + FAISS)...")
+                    status_text.text("Initialising ChromaDB retriever...")
                     collected = rag_collect(
                         queries=queries_list,
                         api_key=api_key,
                         model=model,
-                        prospectos_dir=PROSPECTOS_DIR,
                         responses_dir=RESPONSES_DIR,
-                        chunk_size=chunk_size,
-                        chunk_overlap=80,
                         top_k=top_k,
-                        bm25_weight=bm25_weight,
                         delay=0.3,
                         progress_callback=update_progress,
                         skip_existing=skip_existing,

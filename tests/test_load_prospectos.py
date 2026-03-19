@@ -1,11 +1,10 @@
-"""Tests for prospecto download, structure validation, and section extraction.
+"""Tests for prospecto download, leaflet chunking, and vector store.
 
 Validates that:
 - CIMA API returns well-formed prospecto data
 - Downloaded JSON files have the required fields
-- Section extraction produces non-empty text chunks
-- Section classification maps to correct leaflet numbers (1-6)
-- Incomplete / empty prospectos are detected and flagged
+- HTML leaflet chunking produces correct section-aware chunks
+- ChromaDB vector store indexes and retrieves correctly
 """
 
 import json
@@ -22,11 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.cima_client import CIMAClient
 from src.drug_pairs import Medicamento, DrugPair, get_offline_pairs
-from src.rag_engine import (
-    _walk_and_extract,
-    _strip_html,
-    classify_section,
-    load_prospecto_documents,
+from src.leaflet_chunker import (
+    _html_to_text,
+    _split_into_paragraphs,
+    chunk_section,
+    chunk_drug_leaflet,
 )
 from scripts.download_prospectos import download_prospectos
 
@@ -108,6 +107,19 @@ SAMPLE_BRAND_PROSPECTO_JSON = {
     },
 }
 
+SAMPLE_SECTION_HTML = """\
+<html><body>
+<p>Omeprazol pertenece a un grupo de medicamentos denominados
+«inhibidores de la bomba de protones».</p>
+<p>Actúan reduciendo la cantidad de ácido que produce el estómago.</p>
+<ul>
+<li>Úlcera duodenal</li>
+<li>Úlcera gástrica</li>
+<li>Reflujo gastroesofágico</li>
+</ul>
+</body></html>
+"""
+
 
 @pytest.fixture
 def tmp_prospectos_dir(tmp_path):
@@ -122,13 +134,14 @@ def tmp_prospectos_dir(tmp_path):
 
 
 @pytest.fixture
-def tmp_empty_prospectos_dir(tmp_path):
-    """Create a temp directory with an empty/invalid prospecto."""
-    d = tmp_path / "prospectos_empty"
-    d.mkdir()
-    with open(d / "99999_FAKE_DRUG.json", "w", encoding="utf-8") as f:
-        json.dump(SAMPLE_EMPTY_PROSPECTO, f, ensure_ascii=False)
-    return d
+def tmp_leaflets_dir(tmp_path):
+    """Create a temp directory with sample leaflet HTML files."""
+    pair_dir = tmp_path / "leaflets" / "P01_TEST"
+    pair_dir.mkdir(parents=True)
+    for sec_num in range(1, 7):
+        fpath = pair_dir / f"12345_section_{sec_num}.html"
+        fpath.write_text(SAMPLE_SECTION_HTML, encoding="utf-8")
+    return tmp_path / "leaflets"
 
 
 @pytest.fixture
@@ -193,7 +206,6 @@ class TestCIMAResponseStructure:
     def test_all_six_standard_sections_present(self):
         """A complete prospecto should have all 6 standard leaflet sections."""
         titles = [s["titulo"] for s in SAMPLE_CIMA_DOC_SEGMENTADO["secciones"]]
-        # Check numbered sections 1-6
         for i in range(1, 7):
             found = any(t.startswith(f"{i}.") for t in titles)
             assert found, f"Missing standard section {i}"
@@ -202,7 +214,6 @@ class TestCIMAResponseStructure:
         """Section content should be HTML-formatted string."""
         for sec in SAMPLE_CIMA_DOC_SEGMENTADO["secciones"]:
             assert isinstance(sec["contenido"], str)
-            # CIMA returns HTML content with tags
             assert "<p>" in sec["contenido"] or len(sec["contenido"]) > 20
 
 
@@ -214,20 +225,16 @@ class TestProspectoDownload:
     """Verify download_prospectos creates valid files."""
 
     def test_download_creates_json_files(self, mock_cima_client, sample_drug_pair, tmp_path):
-        """download_prospectos should create JSON files for each drug."""
         prospectos_dir = tmp_path / "prospectos"
         with patch("scripts.download_prospectos.PROSPECTOS_DIR", prospectos_dir):
             download_prospectos(mock_cima_client, [sample_drug_pair])
-
         json_files = list(prospectos_dir.glob("*.json"))
         assert len(json_files) == 2, f"Expected 2 files (brand + generic), got {len(json_files)}"
 
     def test_downloaded_json_has_required_fields(self, mock_cima_client, sample_drug_pair, tmp_path):
-        """Each downloaded JSON must contain nregistro, nombre, es_generico, prospecto_sections."""
         prospectos_dir = tmp_path / "prospectos"
         with patch("scripts.download_prospectos.PROSPECTOS_DIR", prospectos_dir):
             download_prospectos(mock_cima_client, [sample_drug_pair])
-
         required_fields = {"nregistro", "nombre", "labtitular", "es_generico", "prospecto_sections"}
         for fp in prospectos_dir.glob("*.json"):
             with open(fp, encoding="utf-8") as f:
@@ -236,45 +243,33 @@ class TestProspectoDownload:
                 assert field in data, f"Missing field '{field}' in {fp.name}"
 
     def test_downloaded_prospecto_sections_not_empty(self, mock_cima_client, sample_drug_pair, tmp_path):
-        """prospecto_sections must not be None or empty."""
         prospectos_dir = tmp_path / "prospectos"
         with patch("scripts.download_prospectos.PROSPECTOS_DIR", prospectos_dir):
             download_prospectos(mock_cima_client, [sample_drug_pair])
-
         for fp in prospectos_dir.glob("*.json"):
             with open(fp, encoding="utf-8") as f:
                 data = json.load(f)
-            assert data["prospecto_sections"] is not None, (
-                f"prospecto_sections is None in {fp.name}"
-            )
-            assert data["prospecto_sections"], f"prospecto_sections is empty in {fp.name}"
+            assert data["prospecto_sections"] is not None
+            assert data["prospecto_sections"]
 
     def test_skips_already_downloaded(self, mock_cima_client, sample_drug_pair, tmp_path):
-        """Should skip files that already exist."""
         prospectos_dir = tmp_path / "prospectos"
         with patch("scripts.download_prospectos.PROSPECTOS_DIR", prospectos_dir):
             download_prospectos(mock_cima_client, [sample_drug_pair])
-            # Reset call count and download again
             mock_cima_client.get_doc_segmentado.reset_mock()
             download_prospectos(mock_cima_client, [sample_drug_pair])
-
-        # API should NOT be called again since files exist
         mock_cima_client.get_doc_segmentado.assert_not_called()
 
     def test_handles_failed_api_response(self, sample_drug_pair, tmp_path):
-        """Should handle None response from CIMA API gracefully."""
         client = MagicMock(spec=CIMAClient)
         client.get_doc_segmentado.return_value = None
-
         prospectos_dir = tmp_path / "prospectos"
         with patch("scripts.download_prospectos.PROSPECTOS_DIR", prospectos_dir):
             download_prospectos(client, [sample_drug_pair])
-
         json_files = list(prospectos_dir.glob("*.json"))
-        assert len(json_files) == 0, "Should not create files when API returns None"
+        assert len(json_files) == 0
 
     def test_filename_sanitization(self, mock_cima_client, tmp_path):
-        """Drug names with / and spaces should be sanitized in filenames."""
         med = Medicamento(
             nregistro="12345",
             nombre="DRUG/NAME WITH SPACES 20 MG",
@@ -295,219 +290,167 @@ class TestProspectoDownload:
         prospectos_dir = tmp_path / "prospectos"
         with patch("scripts.download_prospectos.PROSPECTOS_DIR", prospectos_dir):
             download_prospectos(mock_cima_client, [pair])
-
         for fp in prospectos_dir.glob("*.json"):
-            assert "/" not in fp.name or os.sep == "/", f"Unsanitized filename: {fp.name}"
-            assert " " not in fp.stem, f"Spaces in filename: {fp.name}"
+            assert "/" not in fp.name or os.sep == "/"
+            assert " " not in fp.stem
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3. Section Extraction from Prospecto JSON
+# 3. HTML to Text Conversion
 # ═════════════════════════════════════════════════════════════════════════════
 
-class TestSectionExtraction:
-    """Verify _walk_and_extract produces correct text from CIMA JSON."""
-
-    def test_extracts_all_sections(self):
-        """Should extract all 6 sections from a complete prospecto."""
-        extracted = _walk_and_extract(SAMPLE_CIMA_DOC_SEGMENTADO)
-        assert len(extracted) >= 6, f"Expected >= 6 sections, got {len(extracted)}"
-
-    def test_extracted_content_not_empty(self):
-        """Every extracted section must have non-empty content."""
-        extracted = _walk_and_extract(SAMPLE_CIMA_DOC_SEGMENTADO)
-        for sec in extracted:
-            assert sec["content"].strip(), f"Empty content in section: {sec['title']}"
-
-    def test_html_stripped_from_content(self):
-        """Extracted content should not contain HTML tags."""
-        extracted = _walk_and_extract(SAMPLE_CIMA_DOC_SEGMENTADO)
-        for sec in extracted:
-            assert "<p>" not in sec["content"], f"HTML not stripped: {sec['content'][:50]}"
-            assert "</" not in sec["content"], f"HTML closing tag found: {sec['content'][:50]}"
-
-    def test_titles_preserved(self):
-        """Section titles should be extracted and preserved."""
-        extracted = _walk_and_extract(SAMPLE_CIMA_DOC_SEGMENTADO)
-        titles = [sec["title"] for sec in extracted if sec["title"]]
-        assert len(titles) >= 5, "Too few titled sections extracted"
-
-    def test_handles_none_input(self):
-        """Should handle None gracefully."""
-        result = _walk_and_extract(None)
-        assert result == []
-
-    def test_handles_empty_dict(self):
-        """Should return empty list for empty dict."""
-        result = _walk_and_extract({})
-        assert result == []
-
-    def test_handles_plain_string(self):
-        """Should wrap a plain string into a section."""
-        result = _walk_and_extract("Simple text content")
-        assert len(result) == 1
-        assert result[0]["content"] == "Simple text content"
-
-    def test_nested_subsections(self):
-        """Should handle nested subsecciones."""
-        nested = {
-            "titulo": "Parent Section",
-            "secciones": [
-                {
-                    "titulo": "Child 1",
-                    "contenido": "<p>Child 1 content text.</p>",
-                },
-                {
-                    "titulo": "Child 2",
-                    "contenido": "<p>Child 2 content text.</p>",
-                },
-            ],
-        }
-        extracted = _walk_and_extract(nested)
-        assert len(extracted) >= 2
-        contents = [s["content"] for s in extracted]
-        assert any("Child 1" in c for c in contents)
-        assert any("Child 2" in c for c in contents)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 4. Section Classification
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestSectionClassification:
-    """Verify classify_section maps text to the correct leaflet section number."""
-
-    @pytest.mark.parametrize("title,expected", [
-        ("1. Qué es Omeprazol y para qué se utiliza", 1),
-        ("2. Qué necesita saber antes de empezar a tomar", 2),
-        ("3. Cómo tomar Omeprazol", 3),
-        ("4. Posibles efectos adversos", 4),
-        ("5. Conservación de Omeprazol", 5),
-        ("6. Contenido del envase e información adicional", 6),
-    ])
-    def test_numbered_titles(self, title, expected):
-        """Numbered titles (1.-6.) should map to correct section."""
-        result = classify_section(title, "")
-        assert result == expected, f"'{title}' → {result}, expected {expected}"
-
-    @pytest.mark.parametrize("title,expected", [
-        ("Qué es y para qué se utiliza", 1),
-        ("Indicaciones terapéuticas", 1),
-        ("Antes de tomar este medicamento", 2),
-        ("No tome este medicamento", 2),
-        ("Cómo tomar este medicamento", 3),
-        ("Posología y forma de administración", 3),
-        ("Posibles efectos adversos", 4),
-        ("Efectos secundarios", 4),
-        ("Conservación", 5),
-        ("Cómo conservar", 5),
-        ("Contenido del envase", 6),
-        ("Información adicional", 6),
-    ])
-    def test_keyword_based_titles(self, title, expected):
-        result = classify_section(title, "")
-        assert result == expected, f"'{title}' → {result}, expected {expected}"
-
-    def test_empty_title_falls_back_to_content(self):
-        """When title is empty, should classify based on content."""
-        content = "Este medicamento puede producir efectos adversos frecuentes como dolor de cabeza."
-        result = classify_section("", content)
-        assert result == 4
-
-    def test_unknown_section_returns_zero(self):
-        """Completely unrecognizable text should return 0."""
-        result = classify_section("", "xyz abc 123")
-        assert result == 0
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 5. Load Prospecto Documents (LangChain integration)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestLoadProspectoDocuments:
-    """Verify load_prospecto_documents produces valid LangChain Documents."""
-
-    def test_loads_documents_from_directory(self, tmp_prospectos_dir):
-        """Should load Documents from prospecto JSON files."""
-        docs = load_prospecto_documents(tmp_prospectos_dir)
-        assert len(docs) > 0, "Should produce at least one Document chunk"
-
-    def test_documents_have_required_metadata(self, tmp_prospectos_dir):
-        """Each Document must have drug_name, nregistro, es_generico, section_number."""
-        docs = load_prospecto_documents(tmp_prospectos_dir)
-        required_meta = {"drug_name", "nregistro", "es_generico", "section_number"}
-        for doc in docs:
-            for key in required_meta:
-                assert key in doc.metadata, f"Missing metadata '{key}' in doc"
-
-    def test_documents_have_nonempty_content(self, tmp_prospectos_dir):
-        """Every Document chunk must have non-empty page_content."""
-        docs = load_prospecto_documents(tmp_prospectos_dir)
-        for doc in docs:
-            assert doc.page_content.strip(), "Document has empty page_content"
-
-    def test_section_numbers_in_valid_range(self, tmp_prospectos_dir):
-        """Section numbers should be 0-6 (0 = unclassified)."""
-        docs = load_prospecto_documents(tmp_prospectos_dir)
-        for doc in docs:
-            sec = doc.metadata["section_number"]
-            assert 0 <= sec <= 6, f"Invalid section_number: {sec}"
-
-    def test_empty_directory_returns_empty(self, tmp_path):
-        """Empty prospectos directory should return empty list."""
-        empty_dir = tmp_path / "empty"
-        empty_dir.mkdir()
-        docs = load_prospecto_documents(empty_dir)
-        assert docs == []
-
-    def test_null_prospecto_sections_handled(self, tmp_empty_prospectos_dir):
-        """Files with None prospecto_sections should not crash."""
-        docs = load_prospecto_documents(tmp_empty_prospectos_dir)
-        # May or may not produce docs, but should not raise
-        assert isinstance(docs, list)
-
-    def test_brand_and_generic_both_loaded(self, tmp_prospectos_dir):
-        """Both brand and generic drug documents should be loaded."""
-        docs = load_prospecto_documents(tmp_prospectos_dir)
-        drug_names = {doc.metadata["drug_name"] for doc in docs}
-        assert len(drug_names) >= 2, f"Expected docs from 2+ drugs, got: {drug_names}"
-
-    def test_chunk_size_respected(self, tmp_prospectos_dir):
-        """Chunks should not exceed chunk_size + overlap."""
-        chunk_size = 300
-        docs = load_prospecto_documents(tmp_prospectos_dir, chunk_size=chunk_size)
-        for doc in docs:
-            # Allow some tolerance for the splitter
-            assert len(doc.page_content) <= chunk_size * 2, (
-                f"Chunk too large: {len(doc.page_content)} chars"
-            )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. HTML Stripping
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestHTMLStripping:
-    """Verify _strip_html removes tags correctly."""
+class TestHTMLToText:
+    """Verify _html_to_text strips HTML and preserves structure."""
 
     def test_strips_paragraph_tags(self):
-        assert _strip_html("<p>Hello world</p>") == "Hello world"
+        result = _html_to_text("<p>Hello world</p>")
+        assert "Hello world" in result
+        assert "<p>" not in result
 
     def test_strips_nested_tags(self):
-        result = _strip_html("<div><p><b>Bold</b> text</p></div>")
+        result = _html_to_text("<div><p><b>Bold</b> text</p></div>")
         assert "<" not in result
         assert "Bold" in result and "text" in result
 
-    def test_preserves_text_content(self):
-        result = _strip_html("<p>Omeprazol 20 mg cápsulas</p>")
-        assert "Omeprazol 20 mg cápsulas" in result
+    def test_preserves_list_items(self):
+        html = "<ul><li>Item 1</li><li>Item 2</li></ul>"
+        result = _html_to_text(html)
+        assert "- Item 1" in result
+        assert "- Item 2" in result
 
-    def test_collapses_whitespace(self):
-        result = _strip_html("<p>word1</p>  <p>word2</p>")
-        assert "  " not in result
+    def test_preserves_paragraph_breaks(self):
+        html = "<p>Paragraph 1</p><p>Paragraph 2</p>"
+        result = _html_to_text(html)
+        assert "Paragraph 1" in result
+        assert "Paragraph 2" in result
 
     def test_empty_input(self):
-        assert _strip_html("") == ""
+        assert _html_to_text("") == ""
 
     def test_no_tags(self):
-        assert _strip_html("plain text") == "plain text"
+        assert "plain text" in _html_to_text("plain text")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. Section-Aware Chunking
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestSectionChunking:
+    """Verify chunk_section produces correct section-aware chunks."""
+
+    def test_produces_chunks(self):
+        chunks = chunk_section(
+            html=SAMPLE_SECTION_HTML,
+            section_number=1,
+            drug_name="TEST DRUG",
+            nregistro="12345",
+            pair_id="P01_TEST",
+            is_generic=False,
+        )
+        assert len(chunks) > 0
+
+    def test_chunks_have_section_header(self):
+        chunks = chunk_section(
+            html=SAMPLE_SECTION_HTML,
+            section_number=4,
+            drug_name="TEST DRUG",
+            nregistro="12345",
+            pair_id="P01_TEST",
+            is_generic=False,
+        )
+        for chunk in chunks:
+            assert chunk["text"].startswith("Sección 4 - Posibles efectos adversos:")
+
+    def test_chunks_have_required_metadata(self):
+        chunks = chunk_section(
+            html=SAMPLE_SECTION_HTML,
+            section_number=1,
+            drug_name="TEST DRUG",
+            nregistro="12345",
+            pair_id="P01_TEST",
+            is_generic=True,
+        )
+        required = {"drug_name", "nregistro", "is_generic", "pair_id",
+                     "section_number", "section_name", "chunk_index",
+                     "char_count", "token_count_approx"}
+        for chunk in chunks:
+            for key in required:
+                assert key in chunk["metadata"], f"Missing metadata '{key}'"
+
+    def test_metadata_values_correct(self):
+        chunks = chunk_section(
+            html=SAMPLE_SECTION_HTML,
+            section_number=2,
+            drug_name="LOSEC 20MG",
+            nregistro="59386",
+            pair_id="P04_OMEPRAZ",
+            is_generic=False,
+        )
+        for chunk in chunks:
+            assert chunk["metadata"]["drug_name"] == "LOSEC 20MG"
+            assert chunk["metadata"]["nregistro"] == "59386"
+            assert chunk["metadata"]["section_number"] == 2
+            assert chunk["metadata"]["is_generic"] is False
+            assert chunk["metadata"]["pair_id"] == "P04_OMEPRAZ"
+
+    def test_empty_html_returns_empty(self):
+        chunks = chunk_section(
+            html="<html><body></body></html>",
+            section_number=1,
+            drug_name="TEST",
+            nregistro="12345",
+            pair_id="P01",
+            is_generic=False,
+        )
+        assert chunks == []
+
+    def test_no_html_tags_in_chunks(self):
+        chunks = chunk_section(
+            html=SAMPLE_SECTION_HTML,
+            section_number=1,
+            drug_name="TEST",
+            nregistro="12345",
+            pair_id="P01",
+            is_generic=False,
+        )
+        for chunk in chunks:
+            text = chunk["text"]
+            assert "<p>" not in text
+            assert "<html>" not in text
+            assert "<body>" not in text
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. Drug Leaflet Chunking from Files
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestDrugLeafletChunking:
+    """Verify chunk_drug_leaflet loads and chunks all sections."""
+
+    def test_loads_all_sections(self, tmp_leaflets_dir):
+        chunks = chunk_drug_leaflet(
+            nregistro="12345",
+            drug_name="TEST DRUG 20MG",
+            pair_id="P01_TEST",
+            is_generic=False,
+            leaflets_dir=tmp_leaflets_dir,
+        )
+        assert len(chunks) > 0
+        section_numbers = {c["metadata"]["section_number"] for c in chunks}
+        assert len(section_numbers) == 6, f"Expected 6 sections, got {section_numbers}"
+
+    def test_handles_missing_sections(self, tmp_path):
+        pair_dir = tmp_path / "leaflets" / "P01_TEST"
+        pair_dir.mkdir(parents=True)
+        # Only create section 1
+        (pair_dir / "12345_section_1.html").write_text(SAMPLE_SECTION_HTML)
+        chunks = chunk_drug_leaflet(
+            nregistro="12345",
+            drug_name="TEST DRUG",
+            pair_id="P01_TEST",
+            is_generic=False,
+            leaflets_dir=tmp_path / "leaflets",
+        )
+        assert len(chunks) > 0
+        section_numbers = {c["metadata"]["section_number"] for c in chunks}
+        assert section_numbers == {1}
