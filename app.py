@@ -222,6 +222,9 @@ elif page == "3. Download Prospectos":
                 total_meds = sum(1 + len(p.generics) for p in pairs)
                 progress = st.progress(0)
 
+                # Also build nregistro config for RAG pipeline
+                nregistro_pairs = []
+
                 for pair in pairs:
                     all_meds = [pair.brand] + pair.generics
                     for med in all_meds:
@@ -243,8 +246,35 @@ elif page == "3. Download Prospectos":
                         downloaded += 1
                         progress.progress(downloaded / total_meds)
 
+                    # Build nregistro config entry
+                    nregistro_pairs.append({
+                        "pair_id": pair.pair_id,
+                        "principio_activo": pair.principio_activo,
+                        "grupo_terapeutico": pair.grupo_terapeutico,
+                        "atc_code": pair.atc_code,
+                        "branded": {
+                            "name": pair.brand.nombre if pair.brand else "",
+                            "nregistro": pair.brand.nregistro if pair.brand else "",
+                            "is_generic": False,
+                        },
+                        "generic": {
+                            "name": pair.generics[0].nombre if pair.generics else "",
+                            "nregistro": pair.generics[0].nregistro if pair.generics else "",
+                            "is_generic": True,
+                        },
+                    })
+
+                # Save nregistro config for RAG pipeline
+                nregistro_path = PAIRS_DIR / "drug_pairs_nregistro.json"
+                PAIRS_DIR.mkdir(parents=True, exist_ok=True)
+                with open(nregistro_path, "w", encoding="utf-8") as f:
+                    json.dump(nregistro_pairs, f, ensure_ascii=False, indent=2)
+
                 progress.empty()
-                st.success(f"Downloaded prospectos for {total_meds} medications.")
+                st.success(
+                    f"Downloaded prospectos for {total_meds} medications. "
+                    f"nregistro config saved for RAG pipeline."
+                )
                 st.rerun()
 
         except Exception as e:
@@ -530,7 +560,10 @@ elif page == "5. Collect Responses":
             "**Block 2** — Dense Retrieval: `paraphrase-multilingual-MiniLM-L12-v2` "
             "embeddings + ChromaDB cosine similarity with metadata filtering\n\n"
             "**Block 3** — Answer Generation: LLM grounded in retrieved chunks with "
-            "section context (MEQa's 'context addition')"
+            "section context (MEQa's 'context addition')\n\n"
+            "**Self-bootstrapping**: If ChromaDB is empty, the pipeline will "
+            "automatically fetch leaflets from CIMA, chunk them, and index them "
+            "before processing queries. No manual pre-steps needed."
         )
 
         api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
@@ -550,14 +583,11 @@ elif page == "5. Collect Responses":
         except Exception:
             pass
 
-        # Check leaflets status
-        leaflet_count = 0
-        if LEAFLETS_DIR.exists():
-            leaflet_count = len(list(LEAFLETS_DIR.glob("**/*.html")))
-
-        # Check nregistro config
-        nregistro_config = PAIRS_DIR / "drug_pairs_nregistro.json"
-        has_nregistro = nregistro_config.exists()
+        # Check data sources
+        prospecto_count = len([
+            f for f in PROSPECTOS_DIR.glob("*.json") if f.name != ".gitkeep"
+        ]) if PROSPECTOS_DIR.exists() else 0
+        leaflet_count = len(list(LEAFLETS_DIR.glob("**/*.html"))) if LEAFLETS_DIR.exists() else 0
 
         col_cfg1, col_cfg2 = st.columns(2)
         with col_cfg1:
@@ -572,92 +602,22 @@ elif page == "5. Collect Responses":
                 help="Number of prospecto chunks fed as context to the LLM.",
             )
         with col_cfg2:
-            st.metric("ChromaDB Chunks Indexed", chroma_count)
-            st.metric("Leaflet HTML Files", leaflet_count)
+            st.metric("ChromaDB Chunks", chroma_count)
+            st.metric("Data Sources", f"{prospecto_count} JSON / {leaflet_count} HTML")
 
         # Status indicators
         if chroma_count > 0:
             st.success(f"**{chroma_count}** chunks indexed in ChromaDB. Ready for retrieval.")
-        elif leaflet_count > 0:
-            st.warning(
-                f"**{leaflet_count}** leaflet HTML files found but not indexed. "
-                "Click **Index Leaflets into ChromaDB** below."
+        elif prospecto_count > 0 or leaflet_count > 0:
+            st.info(
+                f"Data available ({prospecto_count} prospectos, {leaflet_count} leaflets). "
+                "ChromaDB will auto-index on first collection run."
             )
         else:
-            st.warning(
-                "No leaflets fetched yet. Use **Fetch Leaflets from CIMA** below, "
-                "or run **Step 3** to download prospectos first."
+            st.info(
+                "No local data yet. The pipeline will **auto-fetch leaflets from CIMA** "
+                "on first run (may take a few minutes for the initial bootstrap)."
             )
-
-        st.markdown("---")
-
-        # ── Leaflet Fetch & Index controls ──
-        st.subheader("Leaflet Management")
-
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            if has_nregistro:
-                if st.button("Fetch Leaflets from CIMA", type="secondary"):
-                    try:
-                        from src.cima_leaflet_fetcher import fetch_all_leaflets
-                        with open(nregistro_config, encoding="utf-8") as f:
-                            pairs_config = json.load(f)
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-
-                        def update_fetch(current, total):
-                            progress_bar.progress(current / total)
-                            status_text.text(f"Fetching leaflet {current}/{total}...")
-
-                        status_text.text("Fetching leaflet sections from CIMA...")
-                        fetch_all_leaflets(
-                            drug_pairs=pairs_config,
-                            leaflets_dir=LEAFLETS_DIR,
-                            skip_existing=True,
-                            progress_callback=update_fetch,
-                        )
-                        progress_bar.empty()
-                        status_text.empty()
-                        st.success("Leaflets fetched from CIMA.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error fetching leaflets: {e}")
-            else:
-                st.info(
-                    "Run `python scripts/lookup_nregistro.py --save` first to create "
-                    "the drug pairs config with nregistro values."
-                )
-
-        with col_f2:
-            if leaflet_count > 0 or has_nregistro:
-                if st.button("Index Leaflets into ChromaDB", type="secondary"):
-                    try:
-                        from src.leaflet_chunker import chunk_all_leaflets
-                        from src.vector_store import MeQAVectorStore
-
-                        with open(nregistro_config, encoding="utf-8") as f:
-                            pairs_config = json.load(f)
-
-                        status_text = st.empty()
-                        status_text.text("Chunking leaflets...")
-                        chunks = chunk_all_leaflets(
-                            drug_pairs=pairs_config,
-                            leaflets_dir=LEAFLETS_DIR,
-                        )
-
-                        if chunks:
-                            status_text.text(f"Indexing {len(chunks)} chunks into ChromaDB...")
-                            store = MeQAVectorStore(chroma_dir=CHROMA_DIR)
-                            store.clear()
-                            indexed = store.index_chunks(chunks)
-                            status_text.empty()
-                            st.success(f"Indexed **{indexed}** chunks into ChromaDB.")
-                            st.rerun()
-                        else:
-                            status_text.empty()
-                            st.warning("No chunks produced. Check that leaflets are fetched.")
-                    except Exception as e:
-                        st.error(f"Error indexing leaflets: {e}")
 
         st.markdown("---")
 
@@ -676,15 +636,20 @@ elif page == "5. Collect Responses":
                 status_text = st.empty()
 
                 def update_progress(current, total):
-                    progress_bar.progress(current / total)
-                    status_text.text(f"Processing query {current}/{total}...")
+                    if total > 0:
+                        progress_bar.progress(min(current / total, 1.0))
+                    status_text.text(
+                        f"Processing query {current}/{total}..."
+                        if current > 0 else "Auto-bootstrapping: fetching leaflets from CIMA..."
+                    )
 
                 try:
-                    status_text.text("Initialising ChromaDB retriever...")
+                    status_text.text("Initialising RAG pipeline (auto-bootstrap if needed)...")
                     collected = rag_collect(
                         queries=queries_list,
                         api_key=api_key,
                         model=model,
+                        prospectos_dir=PROSPECTOS_DIR,
                         responses_dir=RESPONSES_DIR,
                         top_k=top_k,
                         delay=0.3,

@@ -14,11 +14,9 @@ from pathlib import Path
 
 import requests
 
-from .config import CIMA_DOC_BASE, API_TIMEOUT, DATA_DIR
+from .config import CIMA_DOC_BASE, API_TIMEOUT, LEAFLETS_DIR
 
 logger = logging.getLogger(__name__)
-
-LEAFLETS_DIR = DATA_DIR / "leaflets"
 
 SECTION_NAMES = {
     1: "Qué es y para qué se utiliza",
