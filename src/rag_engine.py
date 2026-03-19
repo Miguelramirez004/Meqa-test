@@ -18,6 +18,7 @@ Key design:
   - Generation: gpt-4o-mini via OpenAI API (temp=0.0 for reproducibility)
   - Section metadata preserved end-to-end (fetch → chunk → embed → retrieve → prompt)
   - Identical pipeline for branded and generic drugs
+  - Self-bootstrapping: auto-fetches leaflets from CIMA if ChromaDB is empty
 """
 
 import hashlib
@@ -31,9 +32,9 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from .config import DATA_DIR, RESPONSES_DIR
-from .cima_leaflet_fetcher import LEAFLETS_DIR
-from .vector_store import MeQAVectorStore, CHROMA_DIR
+from .config import DATA_DIR, RESPONSES_DIR, PROSPECTOS_DIR, PAIRS_DIR
+from .config import LEAFLETS_DIR, CHROMA_DIR
+from .vector_store import MeQAVectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +73,7 @@ SECTION_PREDICTION: dict[str, list[int]] = {
 
 
 def normalise_query(text: str) -> str:
-    """MeQA Block 1 — Normalization module.
-
-    Lowercase, strip accents, remove irrelevant punctuation, collapse whitespace.
-    Used for section prediction and entity extraction (NOT for retrieval).
-    """
+    """MeQA Block 1 — Normalization module."""
     text = text.lower().strip()
     nfkd = unicodedata.normalize("NFKD", text)
     text_no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
@@ -131,13 +128,7 @@ def retrieve_chunks(
     drug_name: str | None = None,
     top_k: int = 5,
 ) -> list[dict]:
-    """Retrieve relevant chunks from the vector store.
-
-    For factual queries: filter by pair_id AND drug_name.
-    For comparative queries: filter by pair_id only (drug_name=None).
-
-    Returns list of result dicts with 'text', 'metadata', 'similarity'.
-    """
+    """Retrieve relevant chunks from the vector store."""
     return store.retrieve(
         query=query_text,
         top_k=top_k,
@@ -175,15 +166,9 @@ se debe consultar el prospecto oficial aprobado por la AEMPS."""
 
 
 def _format_context(results: list[dict]) -> str:
-    """Format retrieved chunks as context for the LLM prompt.
-
-    Each chunk already has its section header prepended (from chunker),
-    so the LLM knows which section the information comes from.
-    This replicates MEQa's "context addition" step.
-    """
+    """Format retrieved chunks as context for the LLM prompt."""
     if not results:
         return ""
-    # Join chunks with --- separators
     parts = [r["text"] for r in results]
     return "\n---\n".join(parts)
 
@@ -196,10 +181,7 @@ def generate_response(
     drug_name: str = "",
     ingredient: str = "",
 ) -> str:
-    """Generate a response using the LLM with retrieved context.
-
-    Uses temperature=0.0 for reproducibility.
-    """
+    """Generate a response using the LLM with retrieved context."""
     if context.strip():
         user_msg = _USER_TEMPLATE.format(context=context, query=query_text)
     else:
@@ -220,30 +202,273 @@ def generate_response(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PIPELINE ORCHESTRATION
+# AUTO-BOOTSTRAP: fetch leaflets from CIMA, chunk, and index into ChromaDB
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _load_drug_pairs_config() -> list[dict]:
-    """Load drug pairs config with nregistro from disk, or return empty list."""
-    config_path = DATA_DIR / "drug_pairs" / "drug_pairs_nregistro.json"
-    if config_path.exists():
-        with open(config_path, encoding="utf-8") as f:
-            return json.load(f)
-    return []
+def _extract_drugs_from_queries(queries: list[dict]) -> list[dict]:
+    """Extract unique (pair_id, drug_name, is_generic) from queries.
 
+    Skips comparative queries (those have compound drug names like 'A vs B').
+    Returns a list of drug dicts suitable for the pipeline config.
+    """
+    seen = set()
+    drugs = []
 
-def _find_drug_in_pairs(drug_name: str, pair_id: str,
-                        drug_pairs: list[dict]) -> dict | None:
-    """Find a drug's config (with nregistro) from the pairs config."""
-    for pair in drug_pairs:
-        if pair["pair_id"] != pair_id:
+    for q in queries:
+        is_generic = q.get("is_generic", "")
+        # Skip comparative queries — they reference two drugs
+        if is_generic == "comparative" or " vs " in q.get("drug_name", ""):
             continue
-        for role in ("branded", "generic"):
-            drug = pair.get(role, {})
-            if drug.get("name", "").upper() == drug_name.upper():
-                return drug
+
+        pair_id = q.get("pair_id", "")
+        drug_name = q.get("drug_name", "")
+        key = (pair_id, drug_name)
+
+        if key not in seen and drug_name:
+            seen.add(key)
+            drugs.append({
+                "pair_id": pair_id,
+                "drug_name": drug_name,
+                "is_generic": bool(is_generic),
+                "principio_activo": q.get("principio_activo", ""),
+            })
+
+    return drugs
+
+
+def _lookup_nregistro_from_cima(drug_name: str) -> str | None:
+    """Look up nregistro from CIMA by exact drug name search."""
+    from .cima_client import CIMAClient
+    cima = CIMAClient(delay=0.5)
+
+    result = cima.search_medicamentos(nombre=drug_name)
+    if not result or "resultados" not in result:
+        logger.warning("CIMA lookup failed for: %s", drug_name[:50])
+        return None
+
+    # Try exact match first
+    for med in result["resultados"]:
+        if med.get("nombre", "").upper() == drug_name.upper():
+            return med["nregistro"]
+
+    # Fallback: first result
+    if result["resultados"]:
+        return result["resultados"][0]["nregistro"]
+
     return None
 
+
+def _try_load_prospecto_json(drug_name: str,
+                             prospectos_dir: Path = PROSPECTOS_DIR) -> dict | None:
+    """Try to find a matching prospecto JSON in data/prospectos/.
+
+    Returns the parsed JSON if found, None otherwise.
+    """
+    if not prospectos_dir.exists():
+        return None
+
+    # Search through existing files
+    for fp in prospectos_dir.glob("*.json"):
+        if fp.name == ".gitkeep":
+            continue
+        try:
+            with open(fp, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("nombre", "").upper() == drug_name.upper():
+                return data
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    return None
+
+
+def _chunk_prospecto_json(
+    data: dict,
+    pair_id: str,
+    is_generic: bool,
+) -> list[dict]:
+    """Chunk a prospecto JSON file (from CIMA segmented API) into section-aware chunks.
+
+    This handles the existing data format from data/prospectos/*.json files.
+    """
+    from .leaflet_chunker import chunk_section, SECTION_NAMES
+
+    drug_name = data.get("nombre", "")
+    nregistro = data.get("nregistro", "")
+    sections_data = data.get("prospecto_sections")
+
+    if not sections_data:
+        return []
+
+    all_chunks = []
+
+    # The prospecto_sections structure has nested secciones
+    secciones = []
+    if isinstance(sections_data, dict):
+        secciones = sections_data.get("secciones", [])
+    elif isinstance(sections_data, list):
+        secciones = sections_data
+
+    for sec in secciones:
+        titulo = sec.get("titulo", "")
+        contenido = sec.get("contenido", "")
+
+        if not contenido:
+            continue
+
+        # Detect section number from title (e.g., "1. Qué es...")
+        sec_num = 0
+        match = re.match(r"^(\d+)\.", titulo)
+        if match:
+            sec_num = int(match.group(1))
+
+        if sec_num < 1 or sec_num > 6:
+            # Try keyword detection
+            titulo_lower = titulo.lower()
+            if "qué es" in titulo_lower or "para qué" in titulo_lower:
+                sec_num = 1
+            elif "antes de" in titulo_lower or "necesita saber" in titulo_lower:
+                sec_num = 2
+            elif "cómo tomar" in titulo_lower or "cómo usar" in titulo_lower:
+                sec_num = 3
+            elif "efectos adversos" in titulo_lower or "efectos secundarios" in titulo_lower:
+                sec_num = 4
+            elif "conserv" in titulo_lower:
+                sec_num = 5
+            elif "contenido" in titulo_lower or "información adicional" in titulo_lower:
+                sec_num = 6
+            else:
+                sec_num = 0
+
+        if sec_num == 0:
+            continue
+
+        # contenido is HTML — pass it to chunk_section
+        section_chunks = chunk_section(
+            html=contenido,
+            section_number=sec_num,
+            drug_name=drug_name,
+            nregistro=nregistro,
+            pair_id=pair_id,
+            is_generic=is_generic,
+        )
+        all_chunks.extend(section_chunks)
+
+    return all_chunks
+
+
+def _bootstrap_index(
+    queries: list[dict],
+    store: MeQAVectorStore,
+    prospectos_dir: Path = PROSPECTOS_DIR,
+    leaflets_dir: Path = LEAFLETS_DIR,
+    progress_callback=None,
+) -> int:
+    """Auto-bootstrap the ChromaDB index from available data sources.
+
+    Strategy (in order of preference):
+    1. Use existing per-section HTML files in data/leaflets/
+    2. Use existing prospecto JSON files in data/prospectos/
+    3. Fetch from CIMA API: look up nregistro by name, fetch per-section HTML
+
+    Returns number of chunks indexed.
+    """
+    from .leaflet_chunker import chunk_section, chunk_drug_leaflet
+
+    drugs = _extract_drugs_from_queries(queries)
+    if not drugs:
+        logger.warning("No drugs found in queries to bootstrap from")
+        return 0
+
+    logger.info("Auto-bootstrapping index for %d unique drugs...", len(drugs))
+
+    all_chunks = []
+    total = len(drugs)
+
+    for i, drug_info in enumerate(drugs):
+        pair_id = drug_info["pair_id"]
+        drug_name = drug_info["drug_name"]
+        is_generic = drug_info["is_generic"]
+
+        if progress_callback:
+            progress_callback(i, total, f"Indexing: {drug_name[:40]}...")
+
+        # --- Strategy 1: Check for existing per-section HTML ---
+        pair_dir = leaflets_dir / pair_id
+        html_files = list(pair_dir.glob("*_section_*.html")) if pair_dir.exists() else []
+
+        if html_files:
+            # Find the nregistro from filenames
+            nregistro = html_files[0].stem.split("_section_")[0]
+            chunks = chunk_drug_leaflet(
+                nregistro=nregistro,
+                drug_name=drug_name,
+                pair_id=pair_id,
+                is_generic=is_generic,
+                leaflets_dir=leaflets_dir,
+            )
+            if chunks:
+                all_chunks.extend(chunks)
+                logger.info("  %s: %d chunks from HTML leaflets", drug_name[:30], len(chunks))
+                continue
+
+        # --- Strategy 2: Check for existing prospecto JSON ---
+        prospecto = _try_load_prospecto_json(drug_name, prospectos_dir)
+        if prospecto:
+            chunks = _chunk_prospecto_json(prospecto, pair_id, is_generic)
+            if chunks:
+                all_chunks.extend(chunks)
+                logger.info("  %s: %d chunks from prospecto JSON", drug_name[:30], len(chunks))
+                continue
+
+        # --- Strategy 3: Fetch from CIMA API ---
+        logger.info("  %s: fetching from CIMA API...", drug_name[:40])
+        nregistro = _lookup_nregistro_from_cima(drug_name)
+        if not nregistro:
+            logger.warning("  %s: could not find nregistro, skipping", drug_name[:40])
+            continue
+
+        # Fetch per-section HTML
+        from .cima_leaflet_fetcher import fetch_and_save_leaflet
+        fetch_results = fetch_and_save_leaflet(
+            nregistro=nregistro,
+            drug_name=drug_name,
+            pair_id=pair_id,
+            leaflets_dir=leaflets_dir,
+            delay=0.5,
+            skip_existing=True,
+        )
+
+        # Chunk the fetched HTML
+        chunks = chunk_drug_leaflet(
+            nregistro=nregistro,
+            drug_name=drug_name,
+            pair_id=pair_id,
+            is_generic=is_generic,
+            leaflets_dir=leaflets_dir,
+        )
+        if chunks:
+            all_chunks.extend(chunks)
+            logger.info("  %s: %d chunks from CIMA fetch", drug_name[:30], len(chunks))
+        else:
+            logger.warning("  %s: no chunks produced after CIMA fetch", drug_name[:30])
+
+    # Index all chunks
+    if all_chunks:
+        logger.info("Indexing %d total chunks into ChromaDB...", len(all_chunks))
+        if progress_callback:
+            progress_callback(total, total, "Embedding and indexing chunks...")
+        indexed = store.index_chunks(all_chunks)
+        logger.info("Indexed %d chunks into ChromaDB", indexed)
+        return indexed
+
+    logger.warning("No chunks produced during bootstrap")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PIPELINE ORCHESTRATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def collect_all_responses(
     queries: list[dict],
@@ -261,41 +486,43 @@ def collect_all_responses(
 ) -> list[dict]:
     """Run the full MeQA-adapted RAG pipeline for all queries.
 
+    Self-bootstrapping: if ChromaDB is empty, automatically fetches leaflets
+    from CIMA API, chunks them, and indexes them before proceeding.
+
     Pipeline per query (following the 3 MeQA blocks):
       Block 1: normalise query → extract entities → predict sections
       Block 2: ChromaDB retrieval filtered by pair_id + drug_name
       Block 3: LLM generation grounded in retrieved chunks
-
-    Args:
-        queries: List of query dicts from query_battery.json.
-        api_key: OpenAI API key.
-        model: Chat model for generation.
-        prospectos_dir: Unused (kept for backward compatibility with app.py).
-        responses_dir: Directory to save response JSONs.
-        chunk_size: Unused (kept for backward compatibility).
-        chunk_overlap: Unused (kept for backward compatibility).
-        top_k: Chunks to retrieve per query (default 5).
-        bm25_weight: Unused (kept for backward compatibility).
-        delay: Seconds between generation API calls.
-        progress_callback: Optional callable(current, total).
-        skip_existing: Skip queries with existing response files.
-
-    Returns:
-        List of newly collected response dicts.
     """
     responses_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load the drug pairs config with nregistro
-    drug_pairs = _load_drug_pairs_config()
 
     # Initialize ChromaDB vector store
     store = MeQAVectorStore(chroma_dir=CHROMA_DIR)
     doc_count = store.count
 
+    # ── AUTO-BOOTSTRAP if ChromaDB is empty ──
+    if doc_count == 0:
+        logger.info("ChromaDB is empty. Auto-bootstrapping from CIMA...")
+
+        def bootstrap_progress(current, total, msg=""):
+            if progress_callback:
+                # Use negative progress to signal bootstrap phase
+                progress_callback(0, len(queries))
+
+        indexed = _bootstrap_index(
+            queries=queries,
+            store=store,
+            prospectos_dir=prospectos_dir or PROSPECTOS_DIR,
+            leaflets_dir=LEAFLETS_DIR,
+            progress_callback=bootstrap_progress,
+        )
+        doc_count = store.count
+        logger.info("Bootstrap complete: %d chunks indexed", doc_count)
+
     if doc_count == 0:
         logger.warning(
-            "ChromaDB is empty. Run leaflet fetch + index first. "
-            "The pipeline will generate responses without RAG context."
+            "ChromaDB is still empty after bootstrap. "
+            "Responses will be generated without RAG context."
         )
 
     # Initialize OpenAI client

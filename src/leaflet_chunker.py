@@ -13,7 +13,16 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-from .cima_leaflet_fetcher import LEAFLETS_DIR, SECTION_NAMES
+from .config import LEAFLETS_DIR
+
+SECTION_NAMES = {
+    1: "Qué es y para qué se utiliza",
+    2: "Qué necesita saber antes de tomar",
+    3: "Cómo tomar",
+    4: "Posibles efectos adversos",
+    5: "Conservación",
+    6: "Contenido del envase e información adicional",
+}
 
 logger = logging.getLogger(__name__)
 
