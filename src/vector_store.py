@@ -1,7 +1,7 @@
-"""ChromaDB vector store with sentence-transformers embeddings.
+"""ChromaDB vector store with built-in ONNX embeddings.
 
-Uses paraphrase-multilingual-MiniLM-L12-v2 for Spanish-native embeddings
-(384-dimensional vectors, free, runs locally).
+Uses ChromaDB's default embedding function (all-MiniLM-L6-v2 ONNX)
+for 384-dimensional vectors that run locally without external downloads.
 
 One shared ChromaDB collection for all drugs; filtered at query time by metadata.
 """
@@ -12,37 +12,23 @@ from pathlib import Path
 
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 from .config import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 CHROMA_DIR = DATA_DIR / "chromadb"
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 COLLECTION_NAME = "meqa_leaflets"
-
-# Singleton for the embedding model (avoid reloading)
-_model_cache: dict = {}
-
-
-def get_embedding_model(model_name: str = EMBEDDING_MODEL) -> SentenceTransformer:
-    """Get or load the sentence-transformers model (cached singleton)."""
-    if model_name not in _model_cache:
-        logger.info("Loading embedding model: %s", model_name)
-        _model_cache[model_name] = SentenceTransformer(model_name)
-    return _model_cache[model_name]
 
 
 class MeQAVectorStore:
     """ChromaDB-based vector store for MEQa leaflet chunks."""
 
-    def __init__(self, chroma_dir: Path = CHROMA_DIR,
-                 model_name: str = EMBEDDING_MODEL):
+    def __init__(self, chroma_dir: Path = CHROMA_DIR):
         self.chroma_dir = chroma_dir
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
-        self.model_name = model_name
-        self._model = None
+        self._embedding_fn = DefaultEmbeddingFunction()
         self._client = chromadb.PersistentClient(
             path=str(chroma_dir),
             settings=Settings(anonymized_telemetry=False),
@@ -50,13 +36,8 @@ class MeQAVectorStore:
         self._collection = self._client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
+            embedding_function=self._embedding_fn,
         )
-
-    @property
-    def model(self) -> SentenceTransformer:
-        if self._model is None:
-            self._model = get_embedding_model(self.model_name)
-        return self._model
 
     @property
     def count(self) -> int:
@@ -81,7 +62,6 @@ class MeQAVectorStore:
         if not chunks:
             return 0
 
-        # Generate embeddings in batches
         texts = [c["text"] for c in chunks]
         ids = [self._chunk_id(c) for c in chunks]
 
@@ -93,19 +73,15 @@ class MeQAVectorStore:
             meta["is_generic"] = 1 if meta.get("is_generic") else 0
             metadatas.append(meta)
 
-        logger.info("Embedding %d chunks...", len(texts))
-        embeddings = self.model.encode(texts, batch_size=batch_size,
-                                       show_progress_bar=True)
-        embeddings_list = embeddings.tolist()
+        logger.info("Indexing %d chunks (embeddings computed by ChromaDB)...", len(texts))
 
-        # Upsert in batches
+        # Upsert in batches — ChromaDB computes embeddings automatically
         indexed = 0
         for i in range(0, len(texts), batch_size):
             end = min(i + batch_size, len(texts))
             self._collection.upsert(
                 ids=ids[i:end],
                 documents=texts[i:end],
-                embeddings=embeddings_list[i:end],
                 metadatas=metadatas[i:end],
             )
             indexed += end - i
@@ -145,13 +121,10 @@ class MeQAVectorStore:
         elif drug_name:
             where_filter = {"drug_name": {"$eq": drug_name}}
 
-        # Embed query
-        query_embedding = self.model.encode([query])[0].tolist()
-
-        # Query ChromaDB
+        # Query ChromaDB — embedding computed automatically from query_texts
         try:
             results = self._collection.query(
-                query_embeddings=[query_embedding],
+                query_texts=[query],
                 n_results=top_k,
                 where=where_filter if where_filter else None,
                 include=["documents", "metadatas", "distances"],
@@ -182,5 +155,6 @@ class MeQAVectorStore:
         self._collection = self._client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
+            embedding_function=self._embedding_fn,
         )
         logger.info("Cleared ChromaDB collection")
