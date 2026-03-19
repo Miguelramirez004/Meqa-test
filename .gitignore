@@ -28,6 +28,7 @@ data/prospectos/*.json
 data/responses/*.json
 data/analysis/*.csv
 data/analysis/*.xlsx
+data/chromadb/
 !data/**/.gitkeep
 
 # Playwright
