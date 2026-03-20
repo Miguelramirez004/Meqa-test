@@ -1,224 +1,205 @@
-"""ChromaDB vector store with OpenAI or local ONNX embeddings.
+"""In-memory vector store using OpenAI embeddings + numpy cosine similarity.
 
-Uses OpenAI text-embedding-3-small when an API key is provided (1536-dim,
-excellent multilingual support).  Falls back to ChromaDB's built-in ONNX
-model (all-MiniLM-L6-v2, 384-dim) when no key is available.
+No external vector DB needed.  Designed for Streamlit Cloud where the
+filesystem is ephemeral.
 
-Supports both persistent (local dev) and ephemeral (Streamlit Cloud) modes.
-One shared ChromaDB collection for all drugs; filtered at query time by metadata.
+Embeds chunks via OpenAI text-embedding-3-small (1536-dim, excellent
+multilingual / Spanish support).  Retrieval is a simple numpy dot-product
+on the (small) set of leaflet chunks — fast enough for ~1000 chunks.
 """
 
 import hashlib
 import logging
-import os
-from pathlib import Path
+import time
+from typing import Optional
 
-import chromadb
-from chromadb.config import Settings
-
-from .config import DATA_DIR
+import numpy as np
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-CHROMA_DIR = DATA_DIR / "chromadb"
-COLLECTION_NAME = "meqa_leaflets"
-
-# Detect Streamlit Cloud: ephemeral filesystem, no persistent ChromaDB
-_ON_STREAMLIT_CLOUD = bool(os.environ.get("STREAMLIT_SERVER_HEADLESS"))
-
-
-def _make_embedding_fn(openai_api_key: str | None = None):
-    """Create the best available embedding function."""
-    if openai_api_key:
-        try:
-            from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-            logger.info("Using OpenAI text-embedding-3-small for embeddings")
-            return OpenAIEmbeddingFunction(
-                api_key=openai_api_key,
-                model_name="text-embedding-3-small",
-            )
-        except Exception as e:
-            logger.warning("OpenAI embedding init failed (%s), falling back to ONNX", e)
-
-    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-    logger.info("Using local ONNX embedding model")
-    return DefaultEmbeddingFunction()
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 1536
+BATCH_SIZE = 50  # Conservative batch size to avoid API limits
 
 
 class MeQAVectorStore:
-    """ChromaDB-based vector store for MEQa leaflet chunks."""
+    """In-memory vector store backed by OpenAI embeddings."""
 
-    def __init__(self, chroma_dir: Path | str = CHROMA_DIR,
-                 openai_api_key: str | None = None,
-                 ephemeral: bool | None = None):
-        """Initialize the vector store.
+    def __init__(self, openai_api_key: str | None = None, **_kwargs):
+        self._client: OpenAI | None = None
+        if openai_api_key:
+            self._client = OpenAI(api_key=openai_api_key)
 
-        Args:
-            chroma_dir: Directory for persistent storage (ignored in ephemeral mode).
-            openai_api_key: OpenAI API key for embeddings (optional).
-            ephemeral: Force ephemeral (in-memory) mode. Auto-detected on
-                       Streamlit Cloud if not specified.
-        """
-        self._ephemeral = ephemeral if ephemeral is not None else _ON_STREAMLIT_CLOUD
-        self._embedding_fn = _make_embedding_fn(openai_api_key)
+        # Parallel lists — kept in sync
+        self._texts: list[str] = []
+        self._metadatas: list[dict] = []
+        self._ids: list[str] = []
+        self._embeddings: np.ndarray | None = None  # shape (N, dim)
 
-        if self._ephemeral:
-            logger.info("Using ephemeral (in-memory) ChromaDB client")
-            self._client = chromadb.EphemeralClient(
-                settings=Settings(anonymized_telemetry=False),
-            )
-        else:
-            self.chroma_dir = Path(chroma_dir)
-            self.chroma_dir.mkdir(parents=True, exist_ok=True)
-            self._client = chromadb.PersistentClient(
-                path=str(self.chroma_dir),
-                settings=Settings(anonymized_telemetry=False),
-            )
-
-        try:
-            self._collection = self._client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=self._embedding_fn,
-            )
-        except ValueError:
-            # Embedding function conflict — recreate the collection
-            logger.info("Embedding function changed, recreating collection")
-            self._client.delete_collection(COLLECTION_NAME)
-            self._collection = self._client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=self._embedding_fn,
-            )
+    # ── public properties ─────────────────────────────────────────────────
 
     @property
     def count(self) -> int:
-        return self._collection.count()
+        return len(self._texts)
 
-    def _chunk_id(self, chunk: dict) -> str:
-        """Generate a deterministic ID for a chunk."""
+    # ── embedding helpers ─────────────────────────────────────────────────
+
+    def _embed_texts(self, texts: list[str]) -> np.ndarray:
+        """Embed texts using OpenAI API with retry logic.  Returns (N, dim) array."""
+        if not self._client:
+            raise RuntimeError("No OpenAI API key — cannot compute embeddings")
+
+        all_vecs: list[list[float]] = []
+        total = len(texts)
+
+        for i in range(0, total, BATCH_SIZE):
+            batch = texts[i : i + BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+            # Retry with exponential backoff
+            for attempt in range(4):
+                try:
+                    resp = self._client.embeddings.create(
+                        input=batch,
+                        model=EMBEDDING_MODEL,
+                    )
+                    all_vecs.extend([d.embedding for d in resp.data])
+                    logger.info("  Embedded batch %d/%d (%d texts)",
+                                batch_num, total_batches, len(batch))
+                    break
+                except Exception as e:
+                    wait = 2 ** attempt
+                    logger.warning("  Embedding batch %d failed (attempt %d/4): %s — retrying in %ds",
+                                    batch_num, attempt + 1, e, wait)
+                    if attempt == 3:
+                        logger.error("  Embedding batch %d failed after 4 attempts: %s", batch_num, e)
+                        raise
+                    time.sleep(wait)
+
+            # Small delay between batches to respect rate limits
+            if i + BATCH_SIZE < total:
+                time.sleep(0.2)
+
+        return np.array(all_vecs, dtype=np.float32)
+
+    # ── chunk ID ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _chunk_id(chunk: dict) -> str:
         meta = chunk["metadata"]
-        key = f"{meta.get('drug_name', '')}_{meta['nregistro']}_{meta['section_number']}_{meta['chunk_index']}"
+        key = (
+            f"{meta.get('drug_name', '')}_{meta.get('nregistro', '')}"
+            f"_{meta.get('section_number', 0)}_{meta.get('chunk_index', 0)}"
+        )
         return hashlib.md5(key.encode()).hexdigest()
 
-    def index_chunks(self, chunks: list[dict], batch_size: int = 100) -> int:
-        """Embed and index all chunks into ChromaDB.
+    # ── indexing ──────────────────────────────────────────────────────────
 
-        Args:
-            chunks: List of chunk dicts with 'text' and 'metadata' keys.
-            batch_size: Number of chunks to process at once.
+    def index_chunks(self, chunks: list[dict]) -> int:
+        """Embed and store chunks in memory.
 
-        Returns:
-            Number of chunks indexed.
+        Returns number of chunks indexed.
         """
         if not chunks:
             return 0
 
-        # Deduplicate by chunk ID (keep first occurrence)
-        seen_ids: set[str] = set()
-        unique_chunks: list[dict] = []
+        # Deduplicate
+        seen: set[str] = set(self._ids)
+        unique: list[dict] = []
         for c in chunks:
             cid = self._chunk_id(c)
-            if cid not in seen_ids:
-                seen_ids.add(cid)
-                unique_chunks.append(c)
-        if len(unique_chunks) < len(chunks):
-            logger.info("Deduplicated %d → %d chunks", len(chunks), len(unique_chunks))
-        chunks = unique_chunks
+            if cid not in seen:
+                seen.add(cid)
+                unique.append(c)
+        if not unique:
+            logger.info("All %d chunks already indexed", len(chunks))
+            return 0
+        if len(unique) < len(chunks):
+            logger.info("Deduplicated %d → %d chunks", len(chunks), len(unique))
 
-        texts = [c["text"] for c in chunks]
-        ids = [self._chunk_id(c) for c in chunks]
+        texts = [c["text"] for c in unique]
+        ids = [self._chunk_id(c) for c in unique]
+        metadatas = [c["metadata"].copy() for c in unique]
 
-        # Prepare metadata (ChromaDB requires flat string/int/float values)
-        metadatas = []
-        for c in chunks:
-            meta = c["metadata"].copy()
-            # Convert bool to int for ChromaDB compatibility
-            meta["is_generic"] = 1 if meta.get("is_generic") else 0
-            metadatas.append(meta)
+        logger.info("Embedding %d chunks via OpenAI %s …", len(texts), EMBEDDING_MODEL)
+        try:
+            new_embeddings = self._embed_texts(texts)
+        except Exception as e:
+            logger.error("Failed to embed chunks: %s", e)
+            raise
 
-        logger.info("Indexing %d chunks (embeddings computed by ChromaDB)...", len(texts))
+        # Append to existing store
+        self._texts.extend(texts)
+        self._ids.extend(ids)
+        self._metadatas.extend(metadatas)
 
-        # Upsert in batches — ChromaDB computes embeddings automatically
-        indexed = 0
-        for i in range(0, len(texts), batch_size):
-            end = min(i + batch_size, len(texts))
-            self._collection.upsert(
-                ids=ids[i:end],
-                documents=texts[i:end],
-                metadatas=metadatas[i:end],
-            )
-            indexed += end - i
-            logger.info("Indexed %d/%d chunks", indexed, len(texts))
+        if self._embeddings is None:
+            self._embeddings = new_embeddings
+        else:
+            self._embeddings = np.vstack([self._embeddings, new_embeddings])
 
-        return indexed
+        logger.info("Indexed %d new chunks (total: %d)", len(unique), self.count)
+        return len(unique)
+
+    # ── retrieval ─────────────────────────────────────────────────────────
 
     def retrieve(
         self,
         query: str,
         top_k: int = 5,
-        pair_id: str | None = None,
-        drug_name: str | None = None,
+        pair_id: Optional[str] = None,
+        drug_name: Optional[str] = None,
     ) -> list[dict]:
-        """Retrieve top-k chunks by cosine similarity with metadata filtering.
+        """Retrieve top-k chunks by cosine similarity.
 
-        Args:
-            query: The query text to embed and search.
-            top_k: Number of results to return.
-            pair_id: Filter by drug pair ID (required).
-            drug_name: Filter by specific drug name (None = both drugs in pair).
-
-        Returns:
-            List of result dicts with 'text', 'metadata', 'similarity' keys.
+        Returns list of dicts with 'text', 'metadata', 'similarity' keys.
         """
-        # Build ChromaDB where filter
-        where_filter = {}
-        if pair_id and drug_name:
-            where_filter = {
-                "$and": [
-                    {"pair_id": {"$eq": pair_id}},
-                    {"drug_name": {"$eq": drug_name}},
-                ]
-            }
-        elif pair_id:
-            where_filter = {"pair_id": {"$eq": pair_id}}
-        elif drug_name:
-            where_filter = {"drug_name": {"$eq": drug_name}}
-
-        # Query ChromaDB — embedding computed automatically from query_texts
-        try:
-            results = self._collection.query(
-                query_texts=[query],
-                n_results=top_k,
-                where=where_filter if where_filter else None,
-                include=["documents", "metadatas", "distances"],
-            )
-        except Exception as e:
-            logger.error("ChromaDB query failed: %s", e)
+        if self._embeddings is None or self.count == 0:
             return []
 
-        # Convert distances to similarity scores (ChromaDB cosine distance = 1 - similarity)
-        output = []
-        if results and results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            ):
-                output.append({
-                    "text": doc,
-                    "metadata": meta,
-                    "similarity": 1.0 - dist,  # cosine similarity
-                })
+        # Embed query
+        try:
+            q_vec = self._embed_texts([query])[0]  # (dim,)
+        except Exception as e:
+            logger.error("Failed to embed query: %s", e)
+            return []
 
-        return output
+        # Cosine similarity (embeddings are already normalised by OpenAI)
+        scores = self._embeddings @ q_vec  # (N,)
+
+        # Apply metadata filters
+        mask = np.ones(len(scores), dtype=bool)
+        if pair_id:
+            mask &= np.array([m.get("pair_id") == pair_id for m in self._metadatas])
+        if drug_name:
+            mask &= np.array([m.get("drug_name") == drug_name for m in self._metadatas])
+
+        scores[~mask] = -1.0  # exclude filtered-out chunks
+
+        # Top-k
+        k = min(top_k, int(mask.sum()))
+        if k == 0:
+            return []
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+
+        return [
+            {
+                "text": self._texts[i],
+                "metadata": self._metadatas[i],
+                "similarity": float(scores[i]),
+            }
+            for i in top_idx
+        ]
+
+    # ── management ────────────────────────────────────────────────────────
 
     def clear(self):
-        """Delete all data from the collection."""
-        self._client.delete_collection(COLLECTION_NAME)
-        self._collection = self._client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=self._embedding_fn,
-        )
-        logger.info("Cleared ChromaDB collection")
+        """Wipe the in-memory store."""
+        self._texts.clear()
+        self._metadatas.clear()
+        self._ids.clear()
+        self._embeddings = None
+        logger.info("Cleared vector store")

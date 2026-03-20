@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import (
     DATA_DIR, QUERIES_DIR, RESPONSES_DIR, ANALYSIS_DIR, PROSPECTOS_DIR, PAIRS_DIR,
-    PUBMED_DIR, LEAFLETS_DIR, CHROMA_DIR,
+    PUBMED_DIR, LEAFLETS_DIR,
 )
 from src.drug_pairs import get_offline_pairs, OFFLINE_PAIRS
 from src.query_generator import generate_queries, save_queries
@@ -549,7 +549,7 @@ elif page == "5. Collect Responses":
                     st.error(f"Error during commercial collection: {e}")
 
     # ══════════════════════════════════════════════════════════════
-    # RAG PIPELINE — CIMA Leaflets + ChromaDB + LLM
+    # RAG PIPELINE — CIMA Leaflets + OpenAI Embeddings + LLM
     # ══════════════════════════════════════════════════════════════
     else:
         st.subheader("MeQA RAG Pipeline Collection")
@@ -557,13 +557,12 @@ elif page == "5. Collect Responses":
             "Adapts the [MeQA architecture](https://arxiv.org/abs/2111.02760) "
             "(AEMPS, Santamaría 2021) using modern dense retrieval:\n\n"
             "**Block 1** — Question Processing: normalisation + NER + section prediction\n\n"
-            "**Block 2** — Dense Retrieval: `paraphrase-multilingual-MiniLM-L12-v2` "
-            "embeddings + ChromaDB cosine similarity with metadata filtering\n\n"
+            "**Block 2** — Dense Retrieval: OpenAI `text-embedding-3-small` "
+            "embeddings + cosine similarity with metadata filtering\n\n"
             "**Block 3** — Answer Generation: LLM grounded in retrieved chunks with "
             "section context (MEQa's 'context addition')\n\n"
-            "**Self-bootstrapping**: If ChromaDB is empty, the pipeline will "
-            "automatically fetch leaflets from CIMA, chunk them, and index them "
-            "before processing queries. No manual pre-steps needed."
+            "**Self-bootstrapping**: The pipeline auto-indexes all available "
+            "prospectos and leaflets before processing queries."
         )
 
         api_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
@@ -574,14 +573,8 @@ elif page == "5. Collect Responses":
                 help="Set `OPENAI_API_KEY` in .streamlit/secrets.toml or enter here.",
             )
 
-        # Check ChromaDB index status
-        chroma_count = 0
-        try:
-            from src.vector_store import MeQAVectorStore
-            _store = MeQAVectorStore(chroma_dir=CHROMA_DIR)
-            chroma_count = _store.count
-        except Exception:
-            pass
+        # Vector store is in-memory — index is built at collection time
+        chroma_count = 0  # Will be populated during RAG collection
 
         # Check data sources
         prospecto_count = len([
@@ -602,16 +595,13 @@ elif page == "5. Collect Responses":
                 help="Number of prospecto chunks fed as context to the LLM.",
             )
         with col_cfg2:
-            st.metric("ChromaDB Chunks", chroma_count)
             st.metric("Data Sources", f"{prospecto_count} JSON / {leaflet_count} HTML")
 
         # Status indicators
-        if chroma_count > 0:
-            st.success(f"**{chroma_count}** chunks indexed in ChromaDB. Ready for retrieval.")
-        elif prospecto_count > 0 or leaflet_count > 0:
+        if prospecto_count > 0 or leaflet_count > 0:
             st.info(
                 f"Data available ({prospecto_count} prospectos, {leaflet_count} leaflets). "
-                "ChromaDB will auto-index on first collection run."
+                "Will be indexed in-memory on collection run."
             )
         else:
             st.info(
@@ -668,7 +658,9 @@ elif page == "5. Collect Responses":
                 except Exception as e:
                     progress_bar.empty()
                     status_text.empty()
+                    import traceback
                     st.error(f"Error during RAG collection: {e}")
+                    st.code(traceback.format_exc(), language="text")
 
     st.markdown("---")
 

@@ -33,7 +33,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from .config import DATA_DIR, RESPONSES_DIR, PROSPECTOS_DIR, PAIRS_DIR
-from .config import LEAFLETS_DIR, CHROMA_DIR
+from .config import LEAFLETS_DIR
 from .vector_store import MeQAVectorStore
 
 logger = logging.getLogger(__name__)
@@ -353,32 +353,60 @@ def _chunk_prospecto_json(
 ) -> list[dict]:
     """Chunk a prospecto JSON file (from CIMA segmented API) into section-aware chunks.
 
-    This handles the existing data format from data/prospectos/*.json files.
+    Handles multiple CIMA API response formats:
+      - prospecto_sections: {titulo: ..., secciones: [{titulo, contenido}, ...]}
+      - prospecto_sections: [{titulo, contenido}, ...]
+      - prospecto_sections: {datos: {secciones: [...]}}
+      - contenido can be str (HTML) or list of str
     """
-    from .leaflet_chunker import chunk_section, SECTION_NAMES
+    from .leaflet_chunker import chunk_section
 
     drug_name = data.get("nombre", "")
     nregistro = data.get("nregistro", "")
     sections_data = data.get("prospecto_sections")
 
     if not sections_data:
+        logger.warning("  %s: prospecto_sections is empty/missing", drug_name[:40])
+        return []
+
+    # ── Extract the secciones list from various possible structures ──
+    secciones = []
+    if isinstance(sections_data, list):
+        secciones = sections_data
+    elif isinstance(sections_data, dict):
+        secciones = sections_data.get("secciones", [])
+        # Nested under 'datos'
+        if not secciones and "datos" in sections_data:
+            datos = sections_data["datos"]
+            if isinstance(datos, dict):
+                secciones = datos.get("secciones", [])
+            elif isinstance(datos, list):
+                secciones = datos
+
+    if not secciones:
+        logger.warning("  %s: no secciones found (keys=%s)",
+                        drug_name[:40],
+                        list(sections_data.keys()) if isinstance(sections_data, dict) else type(sections_data).__name__)
         return []
 
     all_chunks = []
-
-    # The prospecto_sections structure has nested secciones
-    secciones = []
-    if isinstance(sections_data, dict):
-        secciones = sections_data.get("secciones", [])
-    elif isinstance(sections_data, list):
-        secciones = sections_data
+    sec_counter = 0  # Fallback section numbering
 
     for sec in secciones:
-        titulo = sec.get("titulo", "")
-        contenido = sec.get("contenido", "")
-
-        if not contenido:
+        if not isinstance(sec, dict):
             continue
+
+        titulo = sec.get("titulo", sec.get("title", ""))
+        contenido = sec.get("contenido", sec.get("content", ""))
+
+        # contenido can be a list of HTML fragments
+        if isinstance(contenido, list):
+            contenido = "\n".join(str(c) for c in contenido if c)
+
+        if not contenido or not contenido.strip():
+            continue
+
+        sec_counter += 1
 
         # Detect section number from title (e.g., "1. Qué es...")
         sec_num = 0
@@ -401,13 +429,11 @@ def _chunk_prospecto_json(
                 sec_num = 5
             elif "contenido" in titulo_lower or "información adicional" in titulo_lower:
                 sec_num = 6
-            else:
-                sec_num = 0
 
+        # If still unknown, assign sequentially (1-6)
         if sec_num == 0:
-            continue
+            sec_num = min(sec_counter, 6)
 
-        # contenido is HTML — pass it to chunk_section
         section_chunks = chunk_section(
             html=contenido,
             section_number=sec_num,
@@ -417,6 +443,10 @@ def _chunk_prospecto_json(
             is_generic=is_generic,
         )
         all_chunks.extend(section_chunks)
+
+    if not all_chunks:
+        logger.warning("  %s: secciones=%d but chunk_section produced 0 chunks",
+                        drug_name[:40], len(secciones))
 
     return all_chunks
 
@@ -444,8 +474,8 @@ def _bootstrap_index(
 
     # ── Step 1: Bulk-index ALL prospecto JSONs on disk ──
     all_prospectos = _load_all_prospectos(prospectos_dir)
+    logger.info("Step 1: Found %d prospecto JSON files in %s", len(all_prospectos), prospectos_dir)
     if all_prospectos:
-        logger.info("Found %d prospecto JSON files, chunking all...", len(all_prospectos))
 
         # Build pair_id lookup from queries
         pair_lookup: dict[str, str] = {}
@@ -483,6 +513,9 @@ def _bootstrap_index(
             else:
                 logger.warning("  %s: no chunks produced from JSON", nombre[:40])
 
+    logger.info("Step 1 complete: %d chunks from %d prospectos (of %d total JSONs)",
+                 len(all_chunks), len(indexed_nregistros), len(all_prospectos))
+
     # ── Step 2: Index any per-section HTML leaflets ──
     if leaflets_dir.exists():
         for pair_dir in leaflets_dir.iterdir():
@@ -506,8 +539,11 @@ def _bootstrap_index(
                 indexed_nregistros.add(nregistro)
                 logger.info("  %s: %d chunks from HTML", nregistro, len(chunks))
 
+    logger.info("Step 2 complete: %d total chunks so far", len(all_chunks))
+
     # ── Step 3: For drugs not yet covered, try CIMA API ──
     drugs = _extract_drugs_from_queries(queries)
+    logger.info("Step 3: %d unique drugs extracted from queries, checking CIMA API for missing...", len(drugs))
     for drug_info in drugs:
         drug_name = drug_info["drug_name"]
         pair_id = drug_info["pair_id"]
@@ -551,12 +587,17 @@ def _bootstrap_index(
 
     # ── Index all chunks ──
     if all_chunks:
-        logger.info("Indexing %d total chunks into ChromaDB...", len(all_chunks))
+        logger.info("Collected %d total chunks. Sending to OpenAI for embedding...", len(all_chunks))
         if progress_callback:
-            progress_callback(len(drugs), len(drugs), "Embedding and indexing chunks...")
-        indexed = store.index_chunks(all_chunks)
-        logger.info("Indexed %d chunks into ChromaDB", indexed)
-        return indexed
+            progress_callback(len(drugs) if drugs else 0, len(drugs) if drugs else 1,
+                              f"Embedding {len(all_chunks)} chunks via OpenAI...")
+        try:
+            indexed = store.index_chunks(all_chunks)
+            logger.info("Successfully indexed %d chunks", indexed)
+            return indexed
+        except Exception as e:
+            logger.error("Embedding/indexing failed: %s", e)
+            raise
 
     logger.warning("No chunks produced during bootstrap")
     return 0
@@ -592,13 +633,13 @@ def collect_all_responses(
     """
     responses_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize ChromaDB vector store (use OpenAI embeddings if key available)
-    store = MeQAVectorStore(chroma_dir=CHROMA_DIR, openai_api_key=api_key)
+    # Initialize in-memory vector store with OpenAI embeddings
+    store = MeQAVectorStore(openai_api_key=api_key)
     doc_count = store.count
 
-    # ── AUTO-BOOTSTRAP if ChromaDB is empty ──
+    # ── AUTO-BOOTSTRAP if store is empty ──
     if doc_count == 0:
-        logger.info("ChromaDB is empty. Auto-bootstrapping from CIMA...")
+        logger.info("Vector store is empty. Auto-bootstrapping from available data...")
 
         def bootstrap_progress(current, total, msg=""):
             if progress_callback:
@@ -617,7 +658,7 @@ def collect_all_responses(
 
     if doc_count == 0:
         logger.warning(
-            "ChromaDB is still empty after bootstrap. "
+            "Vector store is still empty after bootstrap. "
             "Responses will be generated without RAG context."
         )
 
