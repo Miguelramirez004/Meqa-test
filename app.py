@@ -658,7 +658,9 @@ elif page == "5. Collect Responses":
                 except Exception as e:
                     progress_bar.empty()
                     status_text.empty()
+                    import traceback
                     st.error(f"Error during RAG collection: {e}")
+                    st.code(traceback.format_exc(), language="text")
 
     st.markdown("---")
 

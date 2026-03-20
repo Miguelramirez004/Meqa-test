@@ -1,7 +1,7 @@
 """In-memory vector store using OpenAI embeddings + numpy cosine similarity.
 
 No external vector DB needed.  Designed for Streamlit Cloud where the
-filesystem is ephemeral and ChromaDB's persistent storage doesn't survive.
+filesystem is ephemeral.
 
 Embeds chunks via OpenAI text-embedding-3-small (1536-dim, excellent
 multilingual / Spanish support).  Retrieval is a simple numpy dot-product
@@ -10,6 +10,7 @@ on the (small) set of leaflet chunks — fast enough for ~1000 chunks.
 
 import hashlib
 import logging
+import time
 from typing import Optional
 
 import numpy as np
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
-BATCH_SIZE = 100  # OpenAI allows up to 2048 inputs per call
+BATCH_SIZE = 50  # Conservative batch size to avoid API limits
 
 
 class MeQAVectorStore:
@@ -45,18 +46,42 @@ class MeQAVectorStore:
     # ── embedding helpers ─────────────────────────────────────────────────
 
     def _embed_texts(self, texts: list[str]) -> np.ndarray:
-        """Embed a batch of texts using OpenAI API.  Returns (N, dim) array."""
+        """Embed texts using OpenAI API with retry logic.  Returns (N, dim) array."""
         if not self._client:
             raise RuntimeError("No OpenAI API key — cannot compute embeddings")
 
         all_vecs: list[list[float]] = []
-        for i in range(0, len(texts), BATCH_SIZE):
+        total = len(texts)
+
+        for i in range(0, total, BATCH_SIZE):
             batch = texts[i : i + BATCH_SIZE]
-            resp = self._client.embeddings.create(
-                input=batch,
-                model=EMBEDDING_MODEL,
-            )
-            all_vecs.extend([d.embedding for d in resp.data])
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+            # Retry with exponential backoff
+            for attempt in range(4):
+                try:
+                    resp = self._client.embeddings.create(
+                        input=batch,
+                        model=EMBEDDING_MODEL,
+                    )
+                    all_vecs.extend([d.embedding for d in resp.data])
+                    logger.info("  Embedded batch %d/%d (%d texts)",
+                                batch_num, total_batches, len(batch))
+                    break
+                except Exception as e:
+                    wait = 2 ** attempt
+                    logger.warning("  Embedding batch %d failed (attempt %d/4): %s — retrying in %ds",
+                                    batch_num, attempt + 1, e, wait)
+                    if attempt == 3:
+                        logger.error("  Embedding batch %d failed after 4 attempts: %s", batch_num, e)
+                        raise
+                    time.sleep(wait)
+
+            # Small delay between batches to respect rate limits
+            if i + BATCH_SIZE < total:
+                time.sleep(0.2)
+
         return np.array(all_vecs, dtype=np.float32)
 
     # ── chunk ID ──────────────────────────────────────────────────────────
@@ -72,7 +97,7 @@ class MeQAVectorStore:
 
     # ── indexing ──────────────────────────────────────────────────────────
 
-    def index_chunks(self, chunks: list[dict], batch_size: int = BATCH_SIZE) -> int:
+    def index_chunks(self, chunks: list[dict]) -> int:
         """Embed and store chunks in memory.
 
         Returns number of chunks indexed.
@@ -99,7 +124,11 @@ class MeQAVectorStore:
         metadatas = [c["metadata"].copy() for c in unique]
 
         logger.info("Embedding %d chunks via OpenAI %s …", len(texts), EMBEDDING_MODEL)
-        new_embeddings = self._embed_texts(texts)
+        try:
+            new_embeddings = self._embed_texts(texts)
+        except Exception as e:
+            logger.error("Failed to embed chunks: %s", e)
+            raise
 
         # Append to existing store
         self._texts.extend(texts)
@@ -131,7 +160,11 @@ class MeQAVectorStore:
             return []
 
         # Embed query
-        q_vec = self._embed_texts([query])[0]  # (dim,)
+        try:
+            q_vec = self._embed_texts([query])[0]  # (dim,)
+        except Exception as e:
+            logger.error("Failed to embed query: %s", e)
+            return []
 
         # Cosine similarity (embeddings are already normalised by OpenAI)
         scores = self._embeddings @ q_vec  # (N,)

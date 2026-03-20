@@ -474,8 +474,8 @@ def _bootstrap_index(
 
     # ── Step 1: Bulk-index ALL prospecto JSONs on disk ──
     all_prospectos = _load_all_prospectos(prospectos_dir)
+    logger.info("Step 1: Found %d prospecto JSON files in %s", len(all_prospectos), prospectos_dir)
     if all_prospectos:
-        logger.info("Found %d prospecto JSON files, chunking all...", len(all_prospectos))
 
         # Build pair_id lookup from queries
         pair_lookup: dict[str, str] = {}
@@ -513,6 +513,9 @@ def _bootstrap_index(
             else:
                 logger.warning("  %s: no chunks produced from JSON", nombre[:40])
 
+    logger.info("Step 1 complete: %d chunks from %d prospectos (of %d total JSONs)",
+                 len(all_chunks), len(indexed_nregistros), len(all_prospectos))
+
     # ── Step 2: Index any per-section HTML leaflets ──
     if leaflets_dir.exists():
         for pair_dir in leaflets_dir.iterdir():
@@ -536,8 +539,11 @@ def _bootstrap_index(
                 indexed_nregistros.add(nregistro)
                 logger.info("  %s: %d chunks from HTML", nregistro, len(chunks))
 
+    logger.info("Step 2 complete: %d total chunks so far", len(all_chunks))
+
     # ── Step 3: For drugs not yet covered, try CIMA API ──
     drugs = _extract_drugs_from_queries(queries)
+    logger.info("Step 3: %d unique drugs extracted from queries, checking CIMA API for missing...", len(drugs))
     for drug_info in drugs:
         drug_name = drug_info["drug_name"]
         pair_id = drug_info["pair_id"]
@@ -581,12 +587,17 @@ def _bootstrap_index(
 
     # ── Index all chunks ──
     if all_chunks:
-        logger.info("Indexing %d total chunks into ChromaDB...", len(all_chunks))
+        logger.info("Collected %d total chunks. Sending to OpenAI for embedding...", len(all_chunks))
         if progress_callback:
-            progress_callback(len(drugs), len(drugs), "Embedding and indexing chunks...")
-        indexed = store.index_chunks(all_chunks)
-        logger.info("Indexed %d chunks into ChromaDB", indexed)
-        return indexed
+            progress_callback(len(drugs) if drugs else 0, len(drugs) if drugs else 1,
+                              f"Embedding {len(all_chunks)} chunks via OpenAI...")
+        try:
+            indexed = store.index_chunks(all_chunks)
+            logger.info("Successfully indexed %d chunks", indexed)
+            return indexed
+        except Exception as e:
+            logger.error("Embedding/indexing failed: %s", e)
+            raise
 
     logger.warning("No chunks produced during bootstrap")
     return 0
@@ -622,13 +633,13 @@ def collect_all_responses(
     """
     responses_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize ChromaDB vector store (use OpenAI embeddings if key available)
+    # Initialize in-memory vector store with OpenAI embeddings
     store = MeQAVectorStore(openai_api_key=api_key)
     doc_count = store.count
 
-    # ── AUTO-BOOTSTRAP if ChromaDB is empty ──
+    # ── AUTO-BOOTSTRAP if store is empty ──
     if doc_count == 0:
-        logger.info("ChromaDB is empty. Auto-bootstrapping from CIMA...")
+        logger.info("Vector store is empty. Auto-bootstrapping from available data...")
 
         def bootstrap_progress(current, total, msg=""):
             if progress_callback:
@@ -647,7 +658,7 @@ def collect_all_responses(
 
     if doc_count == 0:
         logger.warning(
-            "ChromaDB is still empty after bootstrap. "
+            "Vector store is still empty after bootstrap. "
             "Responses will be generated without RAG context."
         )
 
