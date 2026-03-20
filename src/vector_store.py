@@ -1,18 +1,20 @@
-"""ChromaDB vector store with built-in ONNX embeddings.
+"""ChromaDB vector store with OpenAI or local ONNX embeddings.
 
-Uses ChromaDB's default embedding function (all-MiniLM-L6-v2 ONNX)
-for 384-dimensional vectors that run locally without external downloads.
+Uses OpenAI text-embedding-3-small when an API key is provided (1536-dim,
+excellent multilingual support).  Falls back to ChromaDB's built-in ONNX
+model (all-MiniLM-L6-v2, 384-dim) when no key is available.
 
+Supports both persistent (local dev) and ephemeral (Streamlit Cloud) modes.
 One shared ChromaDB collection for all drugs; filtered at query time by metadata.
 """
 
 import hashlib
 import logging
+import os
 from pathlib import Path
 
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 from .config import DATA_DIR
 
@@ -21,23 +23,73 @@ logger = logging.getLogger(__name__)
 CHROMA_DIR = DATA_DIR / "chromadb"
 COLLECTION_NAME = "meqa_leaflets"
 
+# Detect Streamlit Cloud: ephemeral filesystem, no persistent ChromaDB
+_ON_STREAMLIT_CLOUD = bool(os.environ.get("STREAMLIT_SERVER_HEADLESS"))
+
+
+def _make_embedding_fn(openai_api_key: str | None = None):
+    """Create the best available embedding function."""
+    if openai_api_key:
+        try:
+            from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+            logger.info("Using OpenAI text-embedding-3-small for embeddings")
+            return OpenAIEmbeddingFunction(
+                api_key=openai_api_key,
+                model_name="text-embedding-3-small",
+            )
+        except Exception as e:
+            logger.warning("OpenAI embedding init failed (%s), falling back to ONNX", e)
+
+    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+    logger.info("Using local ONNX embedding model")
+    return DefaultEmbeddingFunction()
+
 
 class MeQAVectorStore:
     """ChromaDB-based vector store for MEQa leaflet chunks."""
 
-    def __init__(self, chroma_dir: Path | str = CHROMA_DIR):
-        self.chroma_dir = Path(chroma_dir)
-        self.chroma_dir.mkdir(parents=True, exist_ok=True)
-        self._embedding_fn = DefaultEmbeddingFunction()
-        self._client = chromadb.PersistentClient(
-            path=str(chroma_dir),
-            settings=Settings(anonymized_telemetry=False),
-        )
-        self._collection = self._client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=self._embedding_fn,
-        )
+    def __init__(self, chroma_dir: Path | str = CHROMA_DIR,
+                 openai_api_key: str | None = None,
+                 ephemeral: bool | None = None):
+        """Initialize the vector store.
+
+        Args:
+            chroma_dir: Directory for persistent storage (ignored in ephemeral mode).
+            openai_api_key: OpenAI API key for embeddings (optional).
+            ephemeral: Force ephemeral (in-memory) mode. Auto-detected on
+                       Streamlit Cloud if not specified.
+        """
+        self._ephemeral = ephemeral if ephemeral is not None else _ON_STREAMLIT_CLOUD
+        self._embedding_fn = _make_embedding_fn(openai_api_key)
+
+        if self._ephemeral:
+            logger.info("Using ephemeral (in-memory) ChromaDB client")
+            self._client = chromadb.EphemeralClient(
+                settings=Settings(anonymized_telemetry=False),
+            )
+        else:
+            self.chroma_dir = Path(chroma_dir)
+            self.chroma_dir.mkdir(parents=True, exist_ok=True)
+            self._client = chromadb.PersistentClient(
+                path=str(self.chroma_dir),
+                settings=Settings(anonymized_telemetry=False),
+            )
+
+        try:
+            self._collection = self._client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._embedding_fn,
+            )
+        except ValueError:
+            # Embedding function conflict — recreate the collection
+            logger.info("Embedding function changed, recreating collection")
+            self._client.delete_collection(COLLECTION_NAME)
+            self._collection = self._client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+                embedding_function=self._embedding_fn,
+            )
 
     @property
     def count(self) -> int:

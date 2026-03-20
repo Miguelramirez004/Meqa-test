@@ -430,71 +430,106 @@ def _bootstrap_index(
 ) -> int:
     """Auto-bootstrap the ChromaDB index from available data sources.
 
-    Strategy (in order of preference):
-    1. Use existing per-section HTML files in data/leaflets/
-    2. Use existing prospecto JSON files in data/prospectos/
-    3. Fetch from CIMA API: look up nregistro by name, fetch per-section HTML
+    Strategy:
+    1. Index ALL available prospecto JSON files from data/prospectos/
+    2. Index any per-section HTML files from data/leaflets/
+    3. For drugs still missing, fetch from CIMA API
 
     Returns number of chunks indexed.
     """
-    from .leaflet_chunker import chunk_section, chunk_drug_leaflet
+    from .leaflet_chunker import chunk_drug_leaflet
 
-    drugs = _extract_drugs_from_queries(queries)
-    if not drugs:
-        logger.warning("No drugs found in queries to bootstrap from")
-        return 0
+    all_chunks: list[dict] = []
+    indexed_nregistros: set[str] = set()
 
-    logger.info("Auto-bootstrapping index for %d unique drugs...", len(drugs))
+    # ── Step 1: Bulk-index ALL prospecto JSONs on disk ──
+    all_prospectos = _load_all_prospectos(prospectos_dir)
+    if all_prospectos:
+        logger.info("Found %d prospecto JSON files, chunking all...", len(all_prospectos))
 
-    all_chunks = []
-    total = len(drugs)
+        # Build pair_id lookup from queries
+        pair_lookup: dict[str, str] = {}
+        for q in queries:
+            pid = q.get("pair_id", "")
+            # Old format: drug_name directly
+            dn = q.get("drug_name", "")
+            if dn:
+                pair_lookup[dn.upper()] = pid
+            # New format: brand_names / generic_names lists
+            for name_list_key in ("brand_names", "generic_names"):
+                for n in q.get(name_list_key, []):
+                    n_str = n.get("nombre", n) if isinstance(n, dict) else n
+                    pair_lookup[n_str.upper()] = pid
 
-    for i, drug_info in enumerate(drugs):
-        pair_id = drug_info["pair_id"]
-        drug_name = drug_info["drug_name"]
-        is_generic = drug_info["is_generic"]
+        for prospecto in all_prospectos:
+            nreg = prospecto.get("nregistro", "")
+            nombre = prospecto.get("nombre", "")
+            es_generico = prospecto.get("es_generico", False)
 
-        if progress_callback:
-            progress_callback(i, total, f"Indexing: {drug_name[:40]}...")
+            # Try to determine pair_id
+            p_id = pair_lookup.get(nombre.upper(), "")
+            if not p_id:
+                for key, pid in pair_lookup.items():
+                    if (nombre.upper().startswith(key + " ")
+                            or key.startswith(nombre.upper() + " ")):
+                        p_id = pid
+                        break
 
-        # --- Strategy 1: Check for existing per-section HTML ---
-        pair_dir = leaflets_dir / pair_id
-        html_files = list(pair_dir.glob("*_section_*.html")) if pair_dir.exists() else []
+            chunks = _chunk_prospecto_json(prospecto, pair_id=p_id, is_generic=es_generico)
+            if chunks:
+                all_chunks.extend(chunks)
+                indexed_nregistros.add(nreg)
+                logger.info("  %s: %d chunks from JSON", nombre[:40], len(chunks))
+            else:
+                logger.warning("  %s: no chunks produced from JSON", nombre[:40])
 
-        if html_files:
-            # Find the nregistro from filenames
+    # ── Step 2: Index any per-section HTML leaflets ──
+    if leaflets_dir.exists():
+        for pair_dir in leaflets_dir.iterdir():
+            if not pair_dir.is_dir():
+                continue
+            html_files = list(pair_dir.glob("*_section_*.html"))
+            if not html_files:
+                continue
             nregistro = html_files[0].stem.split("_section_")[0]
+            if nregistro in indexed_nregistros:
+                continue
             chunks = chunk_drug_leaflet(
                 nregistro=nregistro,
-                drug_name=drug_name,
-                pair_id=pair_id,
-                is_generic=is_generic,
+                drug_name=pair_dir.name,
+                pair_id=pair_dir.name,
+                is_generic=False,
                 leaflets_dir=leaflets_dir,
             )
             if chunks:
                 all_chunks.extend(chunks)
-                logger.info("  %s: %d chunks from HTML leaflets", drug_name[:30], len(chunks))
-                continue
+                indexed_nregistros.add(nregistro)
+                logger.info("  %s: %d chunks from HTML", nregistro, len(chunks))
 
-        # --- Strategy 2: Check for existing prospecto JSON ---
-        prospecto = _try_load_prospecto_json(drug_name, prospectos_dir)
-        if prospecto:
-            chunks = _chunk_prospecto_json(prospecto, pair_id, is_generic)
-            if chunks:
-                all_chunks.extend(chunks)
-                logger.info("  %s: %d chunks from prospecto JSON", drug_name[:30], len(chunks))
-                continue
+    # ── Step 3: For drugs not yet covered, try CIMA API ──
+    drugs = _extract_drugs_from_queries(queries)
+    for drug_info in drugs:
+        drug_name = drug_info["drug_name"]
+        pair_id = drug_info["pair_id"]
+        is_generic = drug_info["is_generic"]
 
-        # --- Strategy 3: Fetch from CIMA API ---
+        # Skip if any prospecto with a matching name is already indexed
+        if any(drug_name.upper() in nreg_name
+               for nreg_name in [p.get("nombre", "").upper() for p in all_prospectos]
+               if nreg_name):
+            continue
+
         logger.info("  %s: fetching from CIMA API...", drug_name[:40])
         nregistro = _lookup_nregistro_from_cima(drug_name)
         if not nregistro:
             logger.warning("  %s: could not find nregistro, skipping", drug_name[:40])
             continue
 
-        # Fetch per-section HTML
+        if nregistro in indexed_nregistros:
+            continue
+
         from .cima_leaflet_fetcher import fetch_and_save_leaflet
-        fetch_results = fetch_and_save_leaflet(
+        fetch_and_save_leaflet(
             nregistro=nregistro,
             drug_name=drug_name,
             pair_id=pair_id,
@@ -502,8 +537,6 @@ def _bootstrap_index(
             delay=0.5,
             skip_existing=True,
         )
-
-        # Chunk the fetched HTML
         chunks = chunk_drug_leaflet(
             nregistro=nregistro,
             drug_name=drug_name,
@@ -513,55 +546,14 @@ def _bootstrap_index(
         )
         if chunks:
             all_chunks.extend(chunks)
-            logger.info("  %s: %d chunks from CIMA fetch", drug_name[:30], len(chunks))
-        else:
-            logger.warning("  %s: no chunks produced after CIMA fetch", drug_name[:30])
+            indexed_nregistros.add(nregistro)
+            logger.info("  %s: %d chunks from CIMA", drug_name[:30], len(chunks))
 
-    # --- Strategy 4: Bulk-index ALL available prospecto JSONs not yet covered ---
-    # This catches prospectos whose nombre doesn't match any query drug name
-    indexed_nregistros = {c["metadata"]["nregistro"] for c in all_chunks}
-    all_prospectos = _load_all_prospectos(prospectos_dir)
-    bulk_added = 0
-
-    # Build a pair_id lookup from queries for assigning pair_id to orphan prospectos
-    pair_lookup = {}
-    for q in queries:
-        pid = q.get("pair_id", "")
-        for name_list_key in ("brand_names", "generic_names"):
-            for n in q.get(name_list_key, []):
-                n_str = n.get("nombre", n) if isinstance(n, dict) else n
-                pair_lookup[n_str.upper()] = pid
-
-    for prospecto in all_prospectos:
-        nreg = prospecto.get("nregistro", "")
-        if nreg in indexed_nregistros:
-            continue
-        nombre = prospecto.get("nombre", "")
-        es_generico = prospecto.get("es_generico", False)
-        # Try to determine pair_id from the drug pair lookup
-        p_id = pair_lookup.get(nombre.upper(), "")
-        if not p_id:
-            # Try prefix match on pair_lookup keys
-            for key, pid in pair_lookup.items():
-                if nombre.upper().startswith(key + " ") or key.startswith(nombre.upper() + " "):
-                    p_id = pid
-                    break
-        chunks = _chunk_prospecto_json(prospecto, pair_id=p_id, is_generic=es_generico)
-        if chunks:
-            all_chunks.extend(chunks)
-            indexed_nregistros.add(nreg)
-            bulk_added += len(chunks)
-            logger.info("  %s: %d chunks (bulk index)", nombre[:30], len(chunks))
-
-    if bulk_added:
-        logger.info("Bulk-indexed %d additional chunks from %d prospectos",
-                     bulk_added, len(all_prospectos) - len(indexed_nregistros) + len({c["metadata"]["nregistro"] for c in all_chunks}))
-
-    # Index all chunks
+    # ── Index all chunks ──
     if all_chunks:
         logger.info("Indexing %d total chunks into ChromaDB...", len(all_chunks))
         if progress_callback:
-            progress_callback(total, total, "Embedding and indexing chunks...")
+            progress_callback(len(drugs), len(drugs), "Embedding and indexing chunks...")
         indexed = store.index_chunks(all_chunks)
         logger.info("Indexed %d chunks into ChromaDB", indexed)
         return indexed
@@ -600,8 +592,8 @@ def collect_all_responses(
     """
     responses_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize ChromaDB vector store
-    store = MeQAVectorStore(chroma_dir=CHROMA_DIR)
+    # Initialize ChromaDB vector store (use OpenAI embeddings if key available)
+    store = MeQAVectorStore(chroma_dir=CHROMA_DIR, openai_api_key=api_key)
     doc_count = store.count
 
     # ── AUTO-BOOTSTRAP if ChromaDB is empty ──
