@@ -46,7 +46,7 @@ class MeQAVectorStore:
     def _chunk_id(self, chunk: dict) -> str:
         """Generate a deterministic ID for a chunk."""
         meta = chunk["metadata"]
-        key = f"{meta['nregistro']}_{meta['section_number']}_{meta['chunk_index']}"
+        key = f"{meta.get('drug_name', '')}_{meta['nregistro']}_{meta['section_number']}_{meta['chunk_index']}"
         return hashlib.md5(key.encode()).hexdigest()
 
     def index_chunks(self, chunks: list[dict], batch_size: int = 100) -> int:
@@ -61,6 +61,18 @@ class MeQAVectorStore:
         """
         if not chunks:
             return 0
+
+        # Deduplicate by chunk ID (keep first occurrence)
+        seen_ids: set[str] = set()
+        unique_chunks: list[dict] = []
+        for c in chunks:
+            cid = self._chunk_id(c)
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                unique_chunks.append(c)
+        if len(unique_chunks) < len(chunks):
+            logger.info("Deduplicated %d → %d chunks", len(chunks), len(unique_chunks))
+        chunks = unique_chunks
 
         texts = [c["text"] for c in chunks]
         ids = [self._chunk_id(c) for c in chunks]

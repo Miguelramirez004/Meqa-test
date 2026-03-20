@@ -208,30 +208,60 @@ def generate_response(
 def _extract_drugs_from_queries(queries: list[dict]) -> list[dict]:
     """Extract unique (pair_id, drug_name, is_generic) from queries.
 
-    Skips comparative queries (those have compound drug names like 'A vs B').
-    Returns a list of drug dicts suitable for the pipeline config.
+    Handles two query formats:
+      - Old format: each query has a specific drug_name + is_generic bool
+      - New "open" format: drug_name is empty; brand_names/generic_names lists present
+
+    Returns a list of drug dicts suitable for the bootstrap pipeline.
     """
     seen = set()
     drugs = []
 
     for q in queries:
         is_generic = q.get("is_generic", "")
-        # Skip comparative queries — they reference two drugs
-        if is_generic == "comparative" or " vs " in q.get("drug_name", ""):
+        pair_id = q.get("pair_id", "")
+        principio = q.get("principio_activo", "")
+
+        # ── Old format: query has a specific drug_name ──
+        drug_name = q.get("drug_name", "")
+        if drug_name and is_generic != "comparative" and " vs " not in drug_name:
+            key = (pair_id, drug_name)
+            if key not in seen:
+                seen.add(key)
+                drugs.append({
+                    "pair_id": pair_id,
+                    "drug_name": drug_name,
+                    "is_generic": is_generic is True or is_generic == "True",
+                    "principio_activo": principio,
+                })
             continue
 
-        pair_id = q.get("pair_id", "")
-        drug_name = q.get("drug_name", "")
-        key = (pair_id, drug_name)
+        # ── New "open" format: extract from brand_names / generic_names ──
+        for name in q.get("brand_names", []):
+            if isinstance(name, dict):
+                name = name.get("nombre", "")
+            key = (pair_id, name)
+            if name and key not in seen:
+                seen.add(key)
+                drugs.append({
+                    "pair_id": pair_id,
+                    "drug_name": name,
+                    "is_generic": False,
+                    "principio_activo": principio,
+                })
 
-        if key not in seen and drug_name:
-            seen.add(key)
-            drugs.append({
-                "pair_id": pair_id,
-                "drug_name": drug_name,
-                "is_generic": bool(is_generic),
-                "principio_activo": q.get("principio_activo", ""),
-            })
+        for name in q.get("generic_names", []):
+            if isinstance(name, dict):
+                name = name.get("nombre", "")
+            key = (pair_id, name)
+            if name and key not in seen:
+                seen.add(key)
+                drugs.append({
+                    "pair_id": pair_id,
+                    "drug_name": name,
+                    "is_generic": True,
+                    "principio_activo": principio,
+                })
 
     return drugs
 
@@ -262,24 +292,58 @@ def _try_load_prospecto_json(drug_name: str,
                              prospectos_dir: Path = PROSPECTOS_DIR) -> dict | None:
     """Try to find a matching prospecto JSON in data/prospectos/.
 
+    Matches by exact name first, then by prefix (handles short brand names
+    like "Gelocatil" matching "GELOCATIL 650 MG COMPRIMIDOS"), then by
+    substring in the filename (handles brand names embedded in filenames).
+
     Returns the parsed JSON if found, None otherwise.
     """
     if not prospectos_dir.exists():
         return None
 
-    # Search through existing files
+    name_upper = drug_name.upper()
+    best_match = None
+
     for fp in prospectos_dir.glob("*.json"):
         if fp.name == ".gitkeep":
             continue
         try:
             with open(fp, encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("nombre", "").upper() == drug_name.upper():
+            nombre = data.get("nombre", "").upper()
+            # Exact match — return immediately
+            if nombre == name_upper:
                 return data
+            # Prefix match (e.g. "Gelocatil" matches "GELOCATIL 650 MG ...")
+            if nombre.startswith(name_upper + " ") or name_upper.startswith(nombre + " "):
+                best_match = data
+            # Filename substring match (e.g. "Lipitor" in "12345_LIPITOR_20MG.json")
+            elif name_upper in fp.stem.upper().replace("_", " "):
+                best_match = data
         except (json.JSONDecodeError, KeyError):
             continue
 
-    return None
+    return best_match
+
+
+def _load_all_prospectos(prospectos_dir: Path = PROSPECTOS_DIR) -> list[dict]:
+    """Load all prospecto JSON files from the prospectos directory."""
+    if not prospectos_dir.exists():
+        return []
+
+    prospectos = []
+    for fp in prospectos_dir.glob("*.json"):
+        if fp.name == ".gitkeep":
+            continue
+        try:
+            with open(fp, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("prospecto_sections"):
+                prospectos.append(data)
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    return prospectos
 
 
 def _chunk_prospecto_json(
@@ -452,6 +516,46 @@ def _bootstrap_index(
             logger.info("  %s: %d chunks from CIMA fetch", drug_name[:30], len(chunks))
         else:
             logger.warning("  %s: no chunks produced after CIMA fetch", drug_name[:30])
+
+    # --- Strategy 4: Bulk-index ALL available prospecto JSONs not yet covered ---
+    # This catches prospectos whose nombre doesn't match any query drug name
+    indexed_nregistros = {c["metadata"]["nregistro"] for c in all_chunks}
+    all_prospectos = _load_all_prospectos(prospectos_dir)
+    bulk_added = 0
+
+    # Build a pair_id lookup from queries for assigning pair_id to orphan prospectos
+    pair_lookup = {}
+    for q in queries:
+        pid = q.get("pair_id", "")
+        for name_list_key in ("brand_names", "generic_names"):
+            for n in q.get(name_list_key, []):
+                n_str = n.get("nombre", n) if isinstance(n, dict) else n
+                pair_lookup[n_str.upper()] = pid
+
+    for prospecto in all_prospectos:
+        nreg = prospecto.get("nregistro", "")
+        if nreg in indexed_nregistros:
+            continue
+        nombre = prospecto.get("nombre", "")
+        es_generico = prospecto.get("es_generico", False)
+        # Try to determine pair_id from the drug pair lookup
+        p_id = pair_lookup.get(nombre.upper(), "")
+        if not p_id:
+            # Try prefix match on pair_lookup keys
+            for key, pid in pair_lookup.items():
+                if nombre.upper().startswith(key + " ") or key.startswith(nombre.upper() + " "):
+                    p_id = pid
+                    break
+        chunks = _chunk_prospecto_json(prospecto, pair_id=p_id, is_generic=es_generico)
+        if chunks:
+            all_chunks.extend(chunks)
+            indexed_nregistros.add(nreg)
+            bulk_added += len(chunks)
+            logger.info("  %s: %d chunks (bulk index)", nombre[:30], len(chunks))
+
+    if bulk_added:
+        logger.info("Bulk-indexed %d additional chunks from %d prospectos",
+                     bulk_added, len(all_prospectos) - len(indexed_nregistros) + len({c["metadata"]["nregistro"] for c in all_chunks}))
 
     # Index all chunks
     if all_chunks:
