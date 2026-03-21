@@ -598,15 +598,21 @@ elif page == "5. Collect Responses":
             st.metric("Data Sources", f"{prospecto_count} JSON / {leaflet_count} HTML")
 
         # Status indicators
-        if prospecto_count > 0 or leaflet_count > 0:
+        if prospecto_count > 0:
+            st.success(
+                f"**{prospecto_count} prospectos** available on disk. "
+                "Will be chunked, embedded, and indexed in-memory on collection run."
+            )
+        elif leaflet_count > 0:
             st.info(
-                f"Data available ({prospecto_count} prospectos, {leaflet_count} leaflets). "
-                "Will be indexed in-memory on collection run."
+                f"No prospecto JSONs found, but {leaflet_count} HTML leaflets available. "
+                "Will be indexed on collection run."
             )
         else:
-            st.info(
-                "No local data yet. The pipeline will **auto-fetch leaflets from CIMA** "
-                "on first run (may take a few minutes for the initial bootstrap)."
+            st.warning(
+                "**No prospecto data found.** Run **Step 3: Download Prospectos** first "
+                "for best results, or the pipeline will auto-fetch from CIMA API "
+                "(slower, may miss some drugs)."
             )
 
         st.markdown("---")
@@ -634,7 +640,14 @@ elif page == "5. Collect Responses":
                     )
 
                 try:
-                    status_text.text("Initialising RAG pipeline (auto-bootstrap if needed)...")
+                    # Enable logging so bootstrap progress appears in Streamlit Cloud logs
+                    import logging
+                    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+
+                    status_text.text(
+                        "Initialising RAG pipeline — bootstrapping "
+                        f"{prospecto_count} prospectos + {leaflet_count} leaflets..."
+                    )
                     collected = rag_collect(
                         queries=queries_list,
                         api_key=api_key,
