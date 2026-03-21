@@ -50,11 +50,19 @@ class MeQAVectorStore:
         if not self._client:
             raise RuntimeError("No OpenAI API key — cannot compute embeddings")
 
+        # Validate inputs — OpenAI rejects empty strings
+        clean_texts = []
+        for t in texts:
+            t = t.strip()
+            if not t:
+                t = " "  # Minimal placeholder to avoid API error
+            clean_texts.append(t)
+
         all_vecs: list[list[float]] = []
-        total = len(texts)
+        total = len(clean_texts)
 
         for i in range(0, total, BATCH_SIZE):
-            batch = texts[i : i + BATCH_SIZE]
+            batch = clean_texts[i : i + BATCH_SIZE]
             batch_num = i // BATCH_SIZE + 1
             total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 

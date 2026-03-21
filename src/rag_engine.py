@@ -7,18 +7,18 @@ Adaptation of MEQa's 3-block pipeline to a modern RAG system:
 
   MEQa Block 1 (Question Processing)    → query normalisation + entity extraction
                                            + section prediction
-  MEQa Block 2 (Leaflet & Section Ext.) → ChromaDB retrieval with metadata
+  MEQa Block 2 (Leaflet & Section Ext.) → in-memory vector retrieval with metadata
                                            filtering (replaces TF-IDF + VSM/LSI)
   MEQa Block 3 (Answer Extraction)      → LLM generation grounded in retrieved
                                            chunks with section context
 
 Key design:
-  - Embedding: paraphrase-multilingual-MiniLM-L12-v2 (local, Spanish-native)
-  - Vector store: ChromaDB (persistent, local)
+  - Embedding: OpenAI text-embedding-3-small (1536-dim, multilingual)
+  - Vector store: in-memory numpy (no external DB needed)
   - Generation: gpt-4o-mini via OpenAI API (temp=0.0 for reproducibility)
   - Section metadata preserved end-to-end (fetch → chunk → embed → retrieve → prompt)
   - Identical pipeline for branded and generic drugs
-  - Self-bootstrapping: auto-fetches leaflets from CIMA if ChromaDB is empty
+  - Self-bootstrapping: auto-fetches leaflets from CIMA if store is empty
 """
 
 import hashlib
@@ -202,7 +202,7 @@ def generate_response(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AUTO-BOOTSTRAP: fetch leaflets from CIMA, chunk, and index into ChromaDB
+# AUTO-BOOTSTRAP: fetch leaflets from CIMA, chunk, and index into vector store
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _extract_drugs_from_queries(queries: list[dict]) -> list[dict]:
@@ -267,24 +267,62 @@ def _extract_drugs_from_queries(queries: list[dict]) -> list[dict]:
 
 
 def _lookup_nregistro_from_cima(drug_name: str) -> str | None:
-    """Look up nregistro from CIMA by exact drug name search."""
+    """Look up nregistro from CIMA using multiple search strategies.
+
+    Tries (in order):
+      1. Exact full name search
+      2. First word only (brand name, e.g. "LOSEC" from "LOSEC 20 MG ...")
+      3. First two words (brand + dose)
+    """
     from .cima_client import CIMAClient
     cima = CIMAClient(delay=0.5)
 
-    result = cima.search_medicamentos(nombre=drug_name)
-    if not result or "resultados" not in result:
-        logger.warning("CIMA lookup failed for: %s", drug_name[:50])
-        return None
+    name_upper = drug_name.upper().strip()
+    # Build search terms: full name, first word, first two words
+    words = name_upper.split()
+    search_terms = [name_upper]
+    if len(words) > 2:
+        search_terms.append(" ".join(words[:2]))
+    if len(words) > 1:
+        search_terms.append(words[0])
 
-    # Try exact match first
-    for med in result["resultados"]:
-        if med.get("nombre", "").upper() == drug_name.upper():
-            return med["nregistro"]
+    for term in search_terms:
+        try:
+            result = cima.search_medicamentos(nombre=term)
+        except Exception as e:
+            logger.warning("CIMA search error for '%s': %s", term[:40], e)
+            continue
 
-    # Fallback: first result
-    if result["resultados"]:
-        return result["resultados"][0]["nregistro"]
+        if not result or "resultados" not in result:
+            continue
 
+        # Try exact match first
+        for med in result["resultados"]:
+            if med.get("nombre", "").upper() == name_upper:
+                logger.info("  CIMA exact match: %s → %s", term[:30], med["nregistro"])
+                return med["nregistro"]
+
+        # Try prefix match (drug name starts with search term)
+        for med in result["resultados"]:
+            med_name = med.get("nombre", "").upper()
+            if med_name.startswith(name_upper) or name_upper.startswith(med_name):
+                logger.info("  CIMA prefix match: %s → %s", term[:30], med["nregistro"])
+                return med["nregistro"]
+
+        # Fallback: first result with a matching first word
+        first_word = words[0] if words else ""
+        for med in result["resultados"]:
+            if med.get("nombre", "").upper().startswith(first_word):
+                logger.info("  CIMA first-word match: %s → %s", term[:30], med["nregistro"])
+                return med["nregistro"]
+
+        # Last resort: first result from the shortest search term
+        if result["resultados"] and term == search_terms[-1]:
+            nreg = result["resultados"][0]["nregistro"]
+            logger.info("  CIMA fallback match: %s → %s", term[:30], nreg)
+            return nreg
+
+    logger.warning("CIMA lookup failed for: %s (tried %d strategies)", drug_name[:50], len(search_terms))
     return None
 
 
@@ -451,6 +489,95 @@ def _chunk_prospecto_json(
     return all_chunks
 
 
+def _load_nregistro_config(pairs_dir: Path = PAIRS_DIR) -> dict[str, dict]:
+    """Load nregistro config saved during prospecto download (Step 3).
+
+    Returns dict mapping drug name (upper) → {nregistro, pair_id, is_generic}.
+    """
+    config_path = pairs_dir / "drug_pairs_nregistro.json"
+    if not config_path.exists():
+        return {}
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            pairs = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    lookup = {}
+    for pair in pairs:
+        pid = pair.get("pair_id", "")
+        for role in ("branded", "generic"):
+            drug = pair.get(role, {})
+            name = drug.get("name", "").upper()
+            nreg = drug.get("nregistro", "")
+            if name and nreg:
+                lookup[name] = {
+                    "nregistro": nreg,
+                    "pair_id": pid,
+                    "is_generic": drug.get("is_generic", role == "generic"),
+                }
+    return lookup
+
+
+def _fetch_prospecto_from_cima(nregistro: str, drug_name: str,
+                               prospectos_dir: Path = PROSPECTOS_DIR) -> dict | None:
+    """Download a prospecto JSON from CIMA's segmented doc API and save to disk.
+
+    Returns the parsed prospecto dict if successful, None otherwise.
+    """
+    from .cima_client import CIMAClient
+    cima = CIMAClient(delay=0.5)
+
+    try:
+        doc = cima.get_doc_segmentado(nregistro, tipo_doc=2)
+    except Exception as e:
+        logger.warning("  CIMA docSegmentado failed for %s: %s", nregistro, e)
+        return None
+
+    if not doc:
+        return None
+
+    # Check for error responses
+    if isinstance(doc, dict) and "error" in doc:
+        logger.warning("  CIMA returned error for %s: %s", nregistro, doc["error"][:80])
+        return None
+
+    # Save to disk for future runs
+    prospectos_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = drug_name[:40].replace("/", "_").replace(" ", "_")
+    filepath = prospectos_dir / f"{nregistro}_{safe_name}.json"
+
+    prospecto_data = {
+        "nregistro": nregistro,
+        "nombre": drug_name,
+        "es_generico": "EFG" in drug_name.upper(),
+        "prospecto_sections": doc,
+    }
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(prospecto_data, f, ensure_ascii=False, indent=2)
+        logger.info("  Saved prospecto: %s", filepath.name)
+    except OSError as e:
+        logger.warning("  Could not save prospecto: %s", e)
+
+    return prospecto_data
+
+
+def _validate_chunks(chunks: list[dict]) -> list[dict]:
+    """Filter out chunks with empty or too-short text before embedding."""
+    valid = []
+    for c in chunks:
+        text = c.get("text", "").strip()
+        if len(text) < 20:  # Skip chunks shorter than ~6 tokens
+            continue
+        # Ensure text field is clean
+        c["text"] = text
+        valid.append(c)
+    return valid
+
+
 def _bootstrap_index(
     queries: list[dict],
     store: MeQAVectorStore,
@@ -458,12 +585,13 @@ def _bootstrap_index(
     leaflets_dir: Path = LEAFLETS_DIR,
     progress_callback=None,
 ) -> int:
-    """Auto-bootstrap the ChromaDB index from available data sources.
+    """Auto-bootstrap the vector store index from available data sources.
 
     Strategy:
     1. Index ALL available prospecto JSON files from data/prospectos/
     2. Index any per-section HTML files from data/leaflets/
-    3. For drugs still missing, fetch from CIMA API
+    3. For drugs still missing, fetch prospectos from CIMA API
+       (uses nregistro config from Step 3 if available, otherwise searches CIMA)
 
     Returns number of chunks indexed.
     """
@@ -471,52 +599,63 @@ def _bootstrap_index(
 
     all_chunks: list[dict] = []
     indexed_nregistros: set[str] = set()
+    indexed_drug_names: set[str] = set()
+
+    # Build pair_id lookup from queries
+    pair_lookup: dict[str, str] = {}
+    for q in queries:
+        pid = q.get("pair_id", "")
+        dn = q.get("drug_name", "")
+        if dn:
+            pair_lookup[dn.upper()] = pid
+        for name_list_key in ("brand_names", "generic_names"):
+            for n in q.get(name_list_key, []):
+                n_str = n.get("nombre", n) if isinstance(n, dict) else n
+                if n_str:
+                    pair_lookup[n_str.upper()] = pid
+
+    # Load nregistro config from Step 3 (if available)
+    nregistro_config = _load_nregistro_config()
+    if nregistro_config:
+        logger.info("Loaded nregistro config with %d drugs", len(nregistro_config))
 
     # ── Step 1: Bulk-index ALL prospecto JSONs on disk ──
     all_prospectos = _load_all_prospectos(prospectos_dir)
     logger.info("Step 1: Found %d prospecto JSON files in %s", len(all_prospectos), prospectos_dir)
-    if all_prospectos:
 
-        # Build pair_id lookup from queries
-        pair_lookup: dict[str, str] = {}
-        for q in queries:
-            pid = q.get("pair_id", "")
-            # Old format: drug_name directly
-            dn = q.get("drug_name", "")
-            if dn:
-                pair_lookup[dn.upper()] = pid
-            # New format: brand_names / generic_names lists
-            for name_list_key in ("brand_names", "generic_names"):
-                for n in q.get(name_list_key, []):
-                    n_str = n.get("nombre", n) if isinstance(n, dict) else n
-                    pair_lookup[n_str.upper()] = pid
+    for prospecto in all_prospectos:
+        nreg = prospecto.get("nregistro", "")
+        nombre = prospecto.get("nombre", "")
+        es_generico = prospecto.get("es_generico", False)
 
-        for prospecto in all_prospectos:
-            nreg = prospecto.get("nregistro", "")
-            nombre = prospecto.get("nombre", "")
-            es_generico = prospecto.get("es_generico", False)
+        # Determine pair_id — try direct match, then prefix match
+        p_id = pair_lookup.get(nombre.upper(), "")
+        if not p_id:
+            # Check nregistro config
+            cfg = nregistro_config.get(nombre.upper(), {})
+            p_id = cfg.get("pair_id", "")
+        if not p_id:
+            for key, pid in pair_lookup.items():
+                if (nombre.upper().startswith(key + " ")
+                        or key.startswith(nombre.upper() + " ")
+                        or nombre.upper().split()[0] == key.split()[0]):
+                    p_id = pid
+                    break
 
-            # Try to determine pair_id
-            p_id = pair_lookup.get(nombre.upper(), "")
-            if not p_id:
-                for key, pid in pair_lookup.items():
-                    if (nombre.upper().startswith(key + " ")
-                            or key.startswith(nombre.upper() + " ")):
-                        p_id = pid
-                        break
+        chunks = _chunk_prospecto_json(prospecto, pair_id=p_id, is_generic=es_generico)
+        if chunks:
+            all_chunks.extend(chunks)
+            indexed_nregistros.add(nreg)
+            indexed_drug_names.add(nombre.upper())
+            logger.info("  ✓ %s: %d chunks", nombre[:40], len(chunks))
+        else:
+            logger.warning("  ✗ %s: no chunks produced", nombre[:40])
 
-            chunks = _chunk_prospecto_json(prospecto, pair_id=p_id, is_generic=es_generico)
-            if chunks:
-                all_chunks.extend(chunks)
-                indexed_nregistros.add(nreg)
-                logger.info("  %s: %d chunks from JSON", nombre[:40], len(chunks))
-            else:
-                logger.warning("  %s: no chunks produced from JSON", nombre[:40])
-
-    logger.info("Step 1 complete: %d chunks from %d prospectos (of %d total JSONs)",
-                 len(all_chunks), len(indexed_nregistros), len(all_prospectos))
+    logger.info("Step 1 complete: %d chunks from %d prospectos",
+                 len(all_chunks), len(indexed_nregistros))
 
     # ── Step 2: Index any per-section HTML leaflets ──
+    html_chunk_count = 0
     if leaflets_dir.exists():
         for pair_dir in leaflets_dir.iterdir():
             if not pair_dir.is_dir():
@@ -537,26 +676,41 @@ def _bootstrap_index(
             if chunks:
                 all_chunks.extend(chunks)
                 indexed_nregistros.add(nregistro)
-                logger.info("  %s: %d chunks from HTML", nregistro, len(chunks))
+                html_chunk_count += len(chunks)
 
-    logger.info("Step 2 complete: %d total chunks so far", len(all_chunks))
+    logger.info("Step 2 complete: %d chunks from HTML leaflets (%d total)",
+                 html_chunk_count, len(all_chunks))
 
-    # ── Step 3: For drugs not yet covered, try CIMA API ──
+    # ── Step 3: For drugs not yet covered, fetch from CIMA API ──
     drugs = _extract_drugs_from_queries(queries)
-    logger.info("Step 3: %d unique drugs extracted from queries, checking CIMA API for missing...", len(drugs))
+    logger.info("Step 3: %d unique drugs from queries, fetching missing from CIMA...", len(drugs))
+
+    fetched_count = 0
     for drug_info in drugs:
         drug_name = drug_info["drug_name"]
         pair_id = drug_info["pair_id"]
         is_generic = drug_info["is_generic"]
 
-        # Skip if any prospecto with a matching name is already indexed
-        if any(drug_name.upper() in nreg_name
-               for nreg_name in [p.get("nombre", "").upper() for p in all_prospectos]
-               if nreg_name):
+        # Skip if already indexed by name match
+        if drug_name.upper() in indexed_drug_names:
+            continue
+        # Also check partial match
+        if any(drug_name.upper().split()[0] == dn.split()[0]
+               for dn in indexed_drug_names if dn):
             continue
 
-        logger.info("  %s: fetching from CIMA API...", drug_name[:40])
-        nregistro = _lookup_nregistro_from_cima(drug_name)
+        # Try nregistro config first (from Step 3 download)
+        nregistro = None
+        cfg = nregistro_config.get(drug_name.upper(), {})
+        if cfg:
+            nregistro = cfg.get("nregistro")
+            logger.info("  %s: nregistro=%s from config", drug_name[:30], nregistro)
+
+        # Otherwise search CIMA
+        if not nregistro:
+            logger.info("  %s: searching CIMA API...", drug_name[:40])
+            nregistro = _lookup_nregistro_from_cima(drug_name)
+
         if not nregistro:
             logger.warning("  %s: could not find nregistro, skipping", drug_name[:40])
             continue
@@ -564,6 +718,19 @@ def _bootstrap_index(
         if nregistro in indexed_nregistros:
             continue
 
+        # Try fetching the segmented prospecto JSON (preferred)
+        prospecto = _fetch_prospecto_from_cima(nregistro, drug_name, prospectos_dir)
+        if prospecto:
+            chunks = _chunk_prospecto_json(prospecto, pair_id=pair_id, is_generic=is_generic)
+            if chunks:
+                all_chunks.extend(chunks)
+                indexed_nregistros.add(nregistro)
+                indexed_drug_names.add(drug_name.upper())
+                fetched_count += 1
+                logger.info("  ✓ %s: %d chunks from CIMA JSON", drug_name[:30], len(chunks))
+                continue
+
+        # Fallback: fetch HTML leaflet sections
         from .cima_leaflet_fetcher import fetch_and_save_leaflet
         fetch_and_save_leaflet(
             nregistro=nregistro,
@@ -583,24 +750,64 @@ def _bootstrap_index(
         if chunks:
             all_chunks.extend(chunks)
             indexed_nregistros.add(nregistro)
-            logger.info("  %s: %d chunks from CIMA", drug_name[:30], len(chunks))
+            indexed_drug_names.add(drug_name.upper())
+            fetched_count += 1
+            logger.info("  ✓ %s: %d chunks from CIMA HTML", drug_name[:30], len(chunks))
 
-    # ── Index all chunks ──
+    logger.info("Step 3 complete: fetched %d new drugs from CIMA (%d total chunks)",
+                 fetched_count, len(all_chunks))
+
+    # ── Validate and index all chunks ──
     if all_chunks:
-        logger.info("Collected %d total chunks. Sending to OpenAI for embedding...", len(all_chunks))
+        valid_chunks = _validate_chunks(all_chunks)
+        logger.info("Validation: %d/%d chunks valid. Embedding via OpenAI...",
+                     len(valid_chunks), len(all_chunks))
+
+        if not valid_chunks:
+            logger.error("All %d chunks were invalid (empty/too short)", len(all_chunks))
+            return 0
+
         if progress_callback:
-            progress_callback(len(drugs) if drugs else 0, len(drugs) if drugs else 1,
-                              f"Embedding {len(all_chunks)} chunks via OpenAI...")
+            progress_callback(0, 1, f"Embedding {len(valid_chunks)} chunks via OpenAI...")
+
         try:
-            indexed = store.index_chunks(all_chunks)
-            logger.info("Successfully indexed %d chunks", indexed)
+            indexed = store.index_chunks(valid_chunks)
+            logger.info("Successfully indexed %d chunks in vector store", indexed)
             return indexed
         except Exception as e:
-            logger.error("Embedding/indexing failed: %s", e)
-            raise
+            logger.error("Embedding/indexing failed: %s", e, exc_info=True)
+            # Try with smaller batches as fallback
+            logger.info("Retrying with individual batch embedding...")
+            return _index_chunks_with_fallback(store, valid_chunks)
 
-    logger.warning("No chunks produced during bootstrap")
+    logger.warning("No chunks produced during bootstrap — check that prospectos "
+                   "were downloaded (Step 3) and contain valid section data")
     return 0
+
+
+def _index_chunks_with_fallback(store: MeQAVectorStore, chunks: list[dict]) -> int:
+    """Try indexing chunks in smaller batches to isolate failures."""
+    batch_size = 10
+    total_indexed = 0
+
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        try:
+            n = store.index_chunks(batch)
+            total_indexed += n
+        except Exception as e:
+            logger.warning("Batch %d-%d failed: %s — trying individually",
+                           i, i + len(batch), e)
+            for j, chunk in enumerate(batch):
+                try:
+                    n = store.index_chunks([chunk])
+                    total_indexed += n
+                except Exception as e2:
+                    logger.error("Chunk %d failed: text=%s... error=%s",
+                                 i + j, chunk.get("text", "")[:50], e2)
+
+    logger.info("Fallback indexing: %d/%d chunks indexed", total_indexed, len(chunks))
+    return total_indexed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -623,12 +830,12 @@ def collect_all_responses(
 ) -> list[dict]:
     """Run the full MeQA-adapted RAG pipeline for all queries.
 
-    Self-bootstrapping: if ChromaDB is empty, automatically fetches leaflets
+    Self-bootstrapping: if vector store is empty, automatically fetches leaflets
     from CIMA API, chunks them, and indexes them before proceeding.
 
     Pipeline per query (following the 3 MeQA blocks):
       Block 1: normalise query → extract entities → predict sections
-      Block 2: ChromaDB retrieval filtered by pair_id + drug_name
+      Block 2: vector store retrieval filtered by pair_id + drug_name
       Block 3: LLM generation grounded in retrieved chunks
     """
     responses_dir.mkdir(parents=True, exist_ok=True)
@@ -771,7 +978,7 @@ def collect_all_responses(
                 "total_doc_chunks": doc_count,
                 "context_available": bool(context_str),
                 "context_length": len(context_str),
-                "retrieval_method": "chromadb_cosine_multilingual_minilm",
+                "retrieval_method": "openai_embedding_cosine_numpy",
                 "retrieval_details": retrieval_details,
                 "sections_retrieved": sorted(sections_retrieved),
                 "prompt_hash": prompt_hash,
@@ -779,7 +986,7 @@ def collect_all_responses(
             },
             "notes": (
                 f"MeQA-RAG (model={model}, temp=0.0, "
-                f"retrieval=ChromaDB+MiniLM-L12-v2, "
+                f"retrieval=OpenAI-embedding-3-small, "
                 f"top_k={top_k}, "
                 f"sections={sorted(sections_retrieved)}, "
                 f"chunks={len(retrieved)}, "
