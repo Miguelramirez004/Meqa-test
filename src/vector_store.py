@@ -160,7 +160,13 @@ class MeQAVectorStore:
         pair_id: Optional[str] = None,
         drug_name: Optional[str] = None,
     ) -> list[dict]:
-        """Retrieve top-k chunks by cosine similarity.
+        """Retrieve top-k chunks by cosine similarity with progressive filter relaxation.
+
+        Filter strategy (tries each level until results are found):
+          1. pair_id + drug_name (exact match, case-insensitive)
+          2. pair_id only (all drugs in the pair)
+          3. drug_name only (case-insensitive prefix match)
+          4. No filters (pure semantic similarity)
 
         Returns list of dicts with 'text', 'metadata', 'similarity' keys.
         """
@@ -177,30 +183,77 @@ class MeQAVectorStore:
         # Cosine similarity (embeddings are already normalised by OpenAI)
         scores = self._embeddings @ q_vec  # (N,)
 
-        # Apply metadata filters
-        mask = np.ones(len(scores), dtype=bool)
-        if pair_id:
-            mask &= np.array([m.get("pair_id") == pair_id for m in self._metadatas])
-        if drug_name:
-            mask &= np.array([m.get("drug_name") == drug_name for m in self._metadatas])
+        # Build filter masks at different strictness levels
+        drug_upper = drug_name.upper().strip() if drug_name else ""
+        drug_first_word = drug_upper.split()[0] if drug_upper else ""
 
-        scores[~mask] = -1.0  # exclude filtered-out chunks
+        def _pair_mask():
+            return np.array([m.get("pair_id", "") == pair_id for m in self._metadatas])
 
-        # Top-k
-        k = min(top_k, int(mask.sum()))
-        if k == 0:
-            return []
-        top_idx = np.argpartition(scores, -k)[-k:]
-        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+        def _drug_exact_mask():
+            return np.array([
+                m.get("drug_name", "").upper().strip() == drug_upper
+                for m in self._metadatas
+            ])
 
-        return [
-            {
-                "text": self._texts[i],
-                "metadata": self._metadatas[i],
-                "similarity": float(scores[i]),
-            }
-            for i in top_idx
-        ]
+        def _drug_prefix_mask():
+            """Match if either name starts with the other's first word."""
+            if not drug_first_word:
+                return np.ones(len(scores), dtype=bool)
+            return np.array([
+                m.get("drug_name", "").upper().startswith(drug_first_word)
+                or drug_upper.startswith(m.get("drug_name", "").upper().split()[0] if m.get("drug_name", "") else "???")
+                for m in self._metadatas
+            ])
+
+        # Progressive relaxation: try stricter filters first
+        filter_levels = []
+        if pair_id and drug_name:
+            filter_levels.append(("pair_id+drug_exact", lambda: _pair_mask() & _drug_exact_mask()))
+            filter_levels.append(("pair_id+drug_prefix", lambda: _pair_mask() & _drug_prefix_mask()))
+            filter_levels.append(("pair_id_only", _pair_mask))
+            filter_levels.append(("drug_prefix_only", _drug_prefix_mask))
+        elif pair_id:
+            filter_levels.append(("pair_id_only", _pair_mask))
+        elif drug_name:
+            filter_levels.append(("drug_exact", _drug_exact_mask))
+            filter_levels.append(("drug_prefix", _drug_prefix_mask))
+        # Always add no-filter fallback
+        filter_levels.append(("no_filter", lambda: np.ones(len(scores), dtype=bool)))
+
+        for level_name, mask_fn in filter_levels:
+            mask = mask_fn()
+            n_matches = int(mask.sum())
+            if n_matches == 0:
+                continue
+
+            filtered_scores = scores.copy()
+            filtered_scores[~mask] = -1.0
+
+            k = min(top_k, n_matches)
+            top_idx = np.argpartition(filtered_scores, -k)[-k:]
+            top_idx = top_idx[np.argsort(filtered_scores[top_idx])[::-1]]
+
+            # Only accept results with positive similarity
+            results = [
+                {
+                    "text": self._texts[i],
+                    "metadata": self._metadatas[i],
+                    "similarity": float(filtered_scores[i]),
+                }
+                for i in top_idx
+                if filtered_scores[i] > 0.0
+            ]
+
+            if results:
+                if level_name != "pair_id+drug_exact":
+                    logger.info("Retrieval relaxed to '%s' for query (pair=%s, drug=%s): %d results",
+                                level_name, pair_id, (drug_name or "")[:30], len(results))
+                return results
+
+        logger.warning("No chunks found at any filter level for pair=%s drug=%s",
+                       pair_id, (drug_name or "")[:30])
+        return []
 
     # ── management ────────────────────────────────────────────────────────
 
