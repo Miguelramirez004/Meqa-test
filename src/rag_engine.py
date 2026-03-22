@@ -144,36 +144,59 @@ def retrieve_chunks(
 # Fixed system prompt — identical for every single query
 _SYSTEM_PROMPT = (
     "Eres un asistente farmacéutico. Responde a la pregunta del paciente "
-    "basándote principalmente en la información proporcionada en los fragmentos "
-    "del prospecto. Utiliza la información de los fragmentos para elaborar una "
-    "respuesta completa y útil. Si los fragmentos no contienen información "
-    "directamente relevante, usa la información disponible como contexto y "
-    "complementa con tu conocimiento farmacéutico general, indicando qué parte "
-    "proviene del prospecto y qué parte es información general. Responde en español."
+    "utilizando ÚNICAMENTE la información proporcionada en los fragmentos "
+    "del prospecto oficial. Cada fragmento indica de qué medicamento y sección "
+    "del prospecto proviene — cita siempre el nombre del medicamento y la sección "
+    "del prospecto en tu respuesta (por ejemplo: 'Según el prospecto de LOSEC 20 MG, "
+    "sección 1...'). Si la información no aparece en los fragmentos proporcionados, "
+    "indícalo claramente. Responde de forma concisa en español."
 )
 
 _USER_TEMPLATE = """\
-Contexto del prospecto:
+Fragmentos del prospecto oficial (AEMPS):
 ---
 {context}
 ---
 
-Pregunta del paciente: {query}"""
+Pregunta del paciente: {query}
+
+Instrucción: Responde basándote exclusivamente en los fragmentos anteriores. \
+Cita el nombre del medicamento y la sección del prospecto de donde extraes la información."""
 
 _USER_TEMPLATE_NO_CONTEXT = """\
 Pregunta sobre el medicamento "{drug}" ({ingredient}): {query}
 
-NOTA: No se han encontrado fragmentos específicos del prospecto para esta consulta. \
-Responde con tu conocimiento farmacéutico general sobre este medicamento. \
-Incluye la información más relevante y recomienda consultar el prospecto oficial \
-aprobado por la AEMPS para información completa."""
+NOTA: No se han encontrado fragmentos del prospecto para este medicamento. \
+Indica claramente que no se dispone del prospecto y recomienda consultar \
+el prospecto oficial aprobado por la AEMPS."""
 
 
 def _format_context(results: list[dict]) -> str:
-    """Format retrieved chunks as context for the LLM prompt."""
+    """Format retrieved chunks as context for the LLM prompt.
+
+    Each chunk is prefixed with its source (drug name, section, nregistro)
+    so the LLM can cite the prospecto in its response.
+    """
     if not results:
         return ""
-    parts = [r["text"] for r in results]
+    parts = []
+    for r in results:
+        meta = r.get("metadata", {})
+        drug = meta.get("drug_name", "desconocido")
+        section_num = meta.get("section_number", 0)
+        section_name = meta.get("section_name", "")
+        nregistro = meta.get("nregistro", "")
+
+        source = f"[Prospecto: {drug}"
+        if section_num:
+            source += f" — Sección {section_num}"
+            if section_name:
+                source += f": {section_name}"
+        if nregistro:
+            source += f" (nregistro: {nregistro})"
+        source += "]"
+
+        parts.append(f"{source}\n{r['text']}")
     return "\n---\n".join(parts)
 
 
