@@ -144,9 +144,12 @@ def retrieve_chunks(
 # Fixed system prompt — identical for every single query
 _SYSTEM_PROMPT = (
     "Eres un asistente farmacéutico. Responde a la pregunta del paciente "
-    "utilizando ÚNICAMENTE la información proporcionada en los fragmentos "
-    "del prospecto. Si la información no está en los fragmentos proporcionados, "
-    "indica que no se encontró la información en el prospecto. Responde en español."
+    "basándote principalmente en la información proporcionada en los fragmentos "
+    "del prospecto. Utiliza la información de los fragmentos para elaborar una "
+    "respuesta completa y útil. Si los fragmentos no contienen información "
+    "directamente relevante, usa la información disponible como contexto y "
+    "complementa con tu conocimiento farmacéutico general, indicando qué parte "
+    "proviene del prospecto y qué parte es información general. Responde en español."
 )
 
 _USER_TEMPLATE = """\
@@ -160,9 +163,10 @@ Pregunta del paciente: {query}"""
 _USER_TEMPLATE_NO_CONTEXT = """\
 Pregunta sobre el medicamento "{drug}" ({ingredient}): {query}
 
-NOTA: No se ha encontrado el prospecto de este medicamento en la base de datos. \
-Responde con tu conocimiento farmacéutico general pero indica claramente que \
-se debe consultar el prospecto oficial aprobado por la AEMPS."""
+NOTA: No se han encontrado fragmentos específicos del prospecto para esta consulta. \
+Responde con tu conocimiento farmacéutico general sobre este medicamento. \
+Incluye la información más relevante y recomienda consultar el prospecto oficial \
+aprobado por la AEMPS para información completa."""
 
 
 def _format_context(results: list[dict]) -> str:
@@ -863,6 +867,15 @@ def collect_all_responses(
         doc_count = store.count
         logger.info("Bootstrap complete: %d chunks indexed", doc_count)
 
+        # Diagnostic: log unique pair_ids and drug_names in the store
+        if doc_count > 0:
+            pair_ids_in_store = set(m.get("pair_id", "") for m in store._metadatas)
+            drug_names_in_store = set(m.get("drug_name", "")[:40] for m in store._metadatas)
+            logger.info("Store pair_ids: %s", sorted(pair_ids_in_store))
+            logger.info("Store drug_names (%d unique): %s",
+                         len(drug_names_in_store),
+                         sorted(list(drug_names_in_store))[:10])
+
     if doc_count == 0:
         logger.warning(
             "Vector store is still empty after bootstrap. "
@@ -911,6 +924,14 @@ def collect_all_responses(
                 drug_name=filter_drug,
                 top_k=top_k,
             )
+
+            if retrieved:
+                top_sim = retrieved[0].get("similarity", 0)
+                logger.info("[%s] Retrieved %d chunks (top_sim=%.3f) for pair=%s drug=%s",
+                            qid, len(retrieved), top_sim, pair_id, (drug_name or "")[:30])
+            else:
+                logger.warning("[%s] No chunks retrieved for pair=%s drug=%s query=%s",
+                               qid, pair_id, (drug_name or "")[:30], query_text[:50])
 
             # ── BLOCK 3 (part 1): Context assembly ──
             context_str = _format_context(retrieved)
