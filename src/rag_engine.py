@@ -641,6 +641,28 @@ def _bootstrap_index(
                 if n_str:
                     pair_lookup[n_str.upper()] = pid
 
+    # Build canonical pair_id set and normalizer from queries.
+    # Queries use SHORT pair_ids (e.g. "P04_OMEPRAZ") but the nregistro config
+    # from build_pairs_from_cima uses LONG pair_ids (e.g. "P04_OMEPRAZOL").
+    # We normalize all pair_ids to the short canonical forms from queries.
+    canonical_pair_ids: dict[str, str] = {}  # prefix (e.g. "P04_") → short pair_id
+    for q in queries:
+        pid = q.get("pair_id", "")
+        if pid and "_" in pid:
+            prefix = pid.split("_")[0] + "_"  # e.g. "P04_"
+            # Keep the shortest pair_id for each prefix (the query canonical form)
+            if prefix not in canonical_pair_ids or len(pid) < len(canonical_pair_ids[prefix]):
+                canonical_pair_ids[prefix] = pid
+
+    def _normalize_pair_id(pid: str) -> str:
+        """Map any pair_id to its short canonical form from queries."""
+        if not pid or "_" not in pid:
+            return pid
+        prefix = pid.split("_")[0] + "_"
+        return canonical_pair_ids.get(prefix, pid)
+
+    logger.info("Canonical pair_ids from queries: %s", sorted(canonical_pair_ids.values()))
+
     # Load nregistro config from Step 3 (if available)
     nregistro_config = _load_nregistro_config()
     if nregistro_config:
@@ -669,6 +691,9 @@ def _bootstrap_index(
                     p_id = pid
                     break
 
+        # Normalize to short canonical pair_id from queries
+        p_id = _normalize_pair_id(p_id)
+
         chunks = _chunk_prospecto_json(prospecto, pair_id=p_id, is_generic=es_generico)
         if chunks:
             all_chunks.extend(chunks)
@@ -696,7 +721,7 @@ def _bootstrap_index(
             chunks = chunk_drug_leaflet(
                 nregistro=nregistro,
                 drug_name=pair_dir.name,
-                pair_id=pair_dir.name,
+                pair_id=_normalize_pair_id(pair_dir.name),
                 is_generic=False,
                 leaflets_dir=leaflets_dir,
             )
@@ -715,7 +740,7 @@ def _bootstrap_index(
     fetched_count = 0
     for drug_info in drugs:
         drug_name = drug_info["drug_name"]
-        pair_id = drug_info["pair_id"]
+        pair_id = _normalize_pair_id(drug_info["pair_id"])
         is_generic = drug_info["is_generic"]
 
         # Skip if already indexed by name match
@@ -894,10 +919,15 @@ def collect_all_responses(
         if doc_count > 0:
             pair_ids_in_store = set(m.get("pair_id", "") for m in store._metadatas)
             drug_names_in_store = set(m.get("drug_name", "")[:40] for m in store._metadatas)
-            logger.info("Store pair_ids: %s", sorted(pair_ids_in_store))
+            logger.info("Store pair_ids (%d unique): %s", len(pair_ids_in_store), sorted(pair_ids_in_store))
             logger.info("Store drug_names (%d unique): %s",
                          len(drug_names_in_store),
                          sorted(list(drug_names_in_store))[:10])
+            # Warn if any long pair_ids slipped through
+            query_pair_ids = set(q.get("pair_id", "") for q in queries if q.get("pair_id"))
+            unexpected = pair_ids_in_store - query_pair_ids - {""}
+            if unexpected:
+                logger.warning("UNEXPECTED pair_ids in store (not in query battery): %s", sorted(unexpected))
 
     if doc_count == 0:
         logger.warning(
