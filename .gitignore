@@ -29,7 +29,11 @@ data/responses/*.json
 data/analysis/*.csv
 data/analysis/*.xlsx
 data/chromadb/
+data/responses_loose/
 !data/**/.gitkeep
+
+# Experiment outputs
+experiments/__pycache__/
 
 # Playwright
 playwright-report/
