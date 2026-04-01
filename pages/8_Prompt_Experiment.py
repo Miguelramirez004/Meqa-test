@@ -45,6 +45,61 @@ from src.response_analyzer import (
 import re
 from openai import OpenAI
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SAVE HELPER — must be defined before first use
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _save_response(
+    fpath, qid, query, response_text, retrieval_details,
+    sections_retrieved, context_str, model, top_k, condition, doc_count,
+    prompt_text="",
+):
+    normalised = normalise_query(query.get("query_text", ""))
+    entities = extract_entities(query)
+    predicted_secs = predict_sections(query.get("query_category", ""))
+
+    full = f"System: {prompt_text}\n\nUser: {context_str[:200]}"
+    prompt_hash = hashlib.md5(full.encode()).hexdigest()
+    response_hash = hashlib.md5(response_text.encode()).hexdigest() if response_text else ""
+
+    data = {
+        "query_id": qid,
+        "pair_id": query.get("pair_id", ""),
+        "principio_activo": query.get("principio_activo", ""),
+        "grupo_terapeutico": query.get("grupo_terapeutico", ""),
+        "drug_name": query.get("drug_name", ""),
+        "is_generic": query.get("is_generic", ""),
+        "query_type": query.get("query_type", ""),
+        "query_category": query.get("query_category", ""),
+        "query_text": query.get("query_text", ""),
+        "response_text": response_text,
+        "response_word_count": len(response_text.split()) if response_text else 0,
+        "collection_timestamp": datetime.now(timezone.utc).isoformat(),
+        "meqa_metadata": {
+            "model": model,
+            "temperature": 0.0,
+            "normalised_query": normalised,
+            "entities": entities,
+            "predicted_sections": predicted_secs,
+            "predicted_section_names": [LEAFLET_SECTIONS.get(s, "") for s in predicted_secs],
+            "chunks_retrieved": len(retrieval_details),
+            "total_doc_chunks": doc_count,
+            "context_available": bool(context_str),
+            "context_length": len(context_str),
+            "retrieval_method": "openai_embedding_cosine_numpy",
+            "retrieval_details": retrieval_details,
+            "sections_retrieved": sorted(sections_retrieved),
+            "prompt_hash": prompt_hash,
+            "response_hash": response_hash,
+            "experiment_condition": condition,
+        },
+        "notes": f"MeQA-RAG experiment ({condition}) (model={model}, temp=0.0, top_k={top_k})",
+    }
+    with open(fpath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 # ── Page config ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Prompt Experiment", page_icon="🔬", layout="wide")
@@ -305,7 +360,8 @@ if st.button("▶ Run Experiment", type="primary", disabled=not api_key):
             resp_orig_text = resp.choices[0].message.content.strip()
             _save_response(fpath_orig, qid, query, resp_orig_text,
                            retrieval_details, sections_retrieved, context_str,
-                           model, top_k, "original", store.count)
+                           model, top_k, "original", store.count,
+                           prompt_text=ORIGINAL_SYSTEM_PROMPT)
 
         # ── CONDITION B: Loose prompt ──
         fpath_loose = RESPONSES_LOOSE_DIR / f"{qid}.json"
@@ -323,7 +379,8 @@ if st.button("▶ Run Experiment", type="primary", disabled=not api_key):
             resp_loose_text = resp.choices[0].message.content.strip()
             _save_response(fpath_loose, qid, query, resp_loose_text,
                            retrieval_details, sections_retrieved, context_str,
-                           model, top_k, "loose", store.count)
+                           model, top_k, "loose", store.count,
+                           prompt_text=loose_prompt)
 
         # Detect mentions
         m_orig = detect_mentions(resp_orig_text, query)
@@ -471,57 +528,3 @@ if st.session_state.get("experiment_done"):
     # ── Raw data expander ──
     with st.expander("View raw data"):
         st.dataframe(df, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SAVE HELPER (identical to experiments/loose_prompt_test.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _save_response(
-    fpath, qid, query, response_text, retrieval_details,
-    sections_retrieved, context_str, model, top_k, condition, doc_count,
-):
-    normalised = normalise_query(query.get("query_text", ""))
-    entities = extract_entities(query)
-    predicted_secs = predict_sections(query.get("query_category", ""))
-
-    prompt_text = ORIGINAL_SYSTEM_PROMPT if condition == "original" else loose_prompt
-    full = f"System: {prompt_text}\n\nUser: {context_str[:200]}"
-    prompt_hash = hashlib.md5(full.encode()).hexdigest()
-    response_hash = hashlib.md5(response_text.encode()).hexdigest() if response_text else ""
-
-    data = {
-        "query_id": qid,
-        "pair_id": query.get("pair_id", ""),
-        "principio_activo": query.get("principio_activo", ""),
-        "grupo_terapeutico": query.get("grupo_terapeutico", ""),
-        "drug_name": query.get("drug_name", ""),
-        "is_generic": query.get("is_generic", ""),
-        "query_type": query.get("query_type", ""),
-        "query_category": query.get("query_category", ""),
-        "query_text": query.get("query_text", ""),
-        "response_text": response_text,
-        "response_word_count": len(response_text.split()) if response_text else 0,
-        "collection_timestamp": datetime.now(timezone.utc).isoformat(),
-        "meqa_metadata": {
-            "model": model,
-            "temperature": 0.0,
-            "normalised_query": normalised,
-            "entities": entities,
-            "predicted_sections": predicted_secs,
-            "predicted_section_names": [LEAFLET_SECTIONS.get(s, "") for s in predicted_secs],
-            "chunks_retrieved": len(retrieval_details),
-            "total_doc_chunks": doc_count,
-            "context_available": bool(context_str),
-            "context_length": len(context_str),
-            "retrieval_method": "openai_embedding_cosine_numpy",
-            "retrieval_details": retrieval_details,
-            "sections_retrieved": sorted(sections_retrieved),
-            "prompt_hash": prompt_hash,
-            "response_hash": response_hash,
-            "experiment_condition": condition,
-        },
-        "notes": f"MeQA-RAG experiment ({condition}) (model={model}, temp=0.0, top_k={top_k})",
-    }
-    with open(fpath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
