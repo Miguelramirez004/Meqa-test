@@ -271,13 +271,30 @@ def detect_mentions(response_text: str, query: dict) -> dict:
 # RUN EXPERIMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-if st.button("▶ Run Experiment", type="primary", disabled=not api_key):
+# Derive a unique output dir per loose prompt so changing the preset
+# actually regenerates instead of serving stale cached responses.
+_loose_hash = hashlib.md5(loose_prompt.encode()).hexdigest()[:8]
+LOOSE_RUN_DIR = RESPONSES_LOOSE_DIR / f"run_{_loose_hash}"
+
+col_run, col_clear = st.columns([3, 1])
+with col_clear:
+    if st.button("🗑 Clear loose cache"):
+        import shutil
+        if RESPONSES_LOOSE_DIR.exists():
+            shutil.rmtree(RESPONSES_LOOSE_DIR)
+            st.success("Cleared all cached loose responses.")
+            st.rerun()
+
+with col_run:
+    run_clicked = st.button("▶ Run Experiment", type="primary", disabled=not api_key)
+
+if run_clicked:
     if not api_key:
         st.error("Please provide an OpenAI API key.")
         st.stop()
 
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
-    RESPONSES_LOOSE_DIR.mkdir(parents=True, exist_ok=True)
+    LOOSE_RUN_DIR.mkdir(parents=True, exist_ok=True)
 
     # Initialise vector store
     with st.spinner("Initialising vector store..."):
@@ -364,7 +381,7 @@ if st.button("▶ Run Experiment", type="primary", disabled=not api_key):
                            prompt_text=ORIGINAL_SYSTEM_PROMPT)
 
         # ── CONDITION B: Loose prompt ──
-        fpath_loose = RESPONSES_LOOSE_DIR / f"{qid}.json"
+        fpath_loose = LOOSE_RUN_DIR / f"{qid}.json"
         if fpath_loose.exists():
             with open(fpath_loose, encoding="utf-8") as f:
                 resp_loose_text = json.load(f).get("response_text", "")
