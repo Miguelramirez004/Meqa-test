@@ -57,7 +57,7 @@ OFFLINE_PAIRS = [
         "condition": "dolor leve a moderado y fiebre",
         "symptom": "el dolor de cabeza y la fiebre",
         "brand": "Gelocatil",
-        "brands": ["Gelocatil", "Termalgin", "Efferalgan", "Apiretal", "Dolocatil"],
+        "brands": ["Gelocatil", "Efferalgan", "Termalgin", "Apiretal", "Dolostop", "Febrectal", "Xumadol", "Antidol", "Tylenol", "Panadol", "Acertol", "Algidol", "Frenadol"],
         "generics": [
             "Paracetamol Cinfa",
             "Paracetamol Normon",
@@ -76,7 +76,7 @@ OFFLINE_PAIRS = [
         "condition": "dolor e inflamación",
         "symptom": "el dolor y la inflamación",
         "brand": "Nurofen",
-        "brands": ["Nurofen", "Espidifen", "Dalsy", "Dobupal", "Bexistar"],
+        "brands": ["Nurofen", "Espidifen", "Saetil", "Dalsy", "Algidol", "Advil", "Motrin", "Brufen"],
         "generics": [
             "Ibuprofeno Cinfa",
             "Ibuprofeno Normon",
@@ -95,7 +95,7 @@ OFFLINE_PAIRS = [
         "condition": "infecciones bacterianas",
         "symptom": "una infección bacteriana",
         "brand": "Clamoxyl",
-        "brands": ["Clamoxyl", "Amoxicilina Beecham"],
+        "brands": ["Clamoxyl", "Augmentine", "Ardine", "Amoxaren", "Hosboral"],
         "generics": [
             "Amoxicilina Cinfa",
             "Amoxicilina Normon",
@@ -114,7 +114,7 @@ OFFLINE_PAIRS = [
         "condition": "acidez gástrica y reflujo gastroesofágico",
         "symptom": "la acidez de estómago",
         "brand": "Losec",
-        "brands": ["Losec", "Belfa", "Mopral"],
+        "brands": ["Losec", "Mopral", "Ulceral", "Prilosec", "Nexium", "Pariet", "Pantecta", "Zurcal", "Lanzol"],
         "generics": [
             "Omeprazol Cinfa",
             "Omeprazol Normon",
@@ -134,7 +134,7 @@ OFFLINE_PAIRS = [
         "condition": "hipercolesterolemia",
         "symptom": "el colesterol alto",
         "brand": "Lipitor",
-        "brands": ["Lipitor", "Cardyl", "Zarator"],
+        "brands": ["Lipitor", "Cardyl", "Prevencor", "Zarator", "Crestor"],
         "generics": [
             "Atorvastatina Cinfa",
             "Atorvastatina Normon",
@@ -153,7 +153,7 @@ OFFLINE_PAIRS = [
         "condition": "hipertensión arterial e insuficiencia cardíaca",
         "symptom": "la tensión alta",
         "brand": "Renitec",
-        "brands": ["Renitec", "Cardiovasil", "Dilvas"],
+        "brands": ["Renitec", "Dabonal", "Acetensil"],
         "generics": [
             "Enalapril Cinfa",
             "Enalapril Normon",
@@ -245,7 +245,7 @@ OFFLINE_PAIRS = [
         "condition": "hipertensión arterial y angina de pecho",
         "symptom": "la tensión alta",
         "brand": "Norvasc",
-        "brands": ["Norvasc", "Astudal", "Neotensin"],
+        "brands": ["Norvasc", "Astudal"],
         "generics": [
             "Amlodipino Cinfa",
             "Amlodipino Normon",
@@ -264,7 +264,7 @@ OFFLINE_PAIRS = [
         "condition": "infecciones respiratorias y de tejidos blandos",
         "symptom": "una infección respiratoria",
         "brand": "Zithromax",
-        "brands": ["Zithromax", "Vinzam", "Toraseptol"],
+        "brands": ["Zithromax", "Toraseptol", "Vinzam"],
         "generics": [
             "Azitromicina Cinfa",
             "Azitromicina Normon",
@@ -302,7 +302,7 @@ OFFLINE_PAIRS = [
         "condition": "depresión mayor y trastorno obsesivo-compulsivo",
         "symptom": "la depresión",
         "brand": "Prozac",
-        "brands": ["Prozac", "Adofen", "Reneuron"],
+        "brands": ["Prozac", "Adofen", "Reneuron", "Luramon"],
         "generics": [
             "Fluoxetina Cinfa",
             "Fluoxetina Normon",
@@ -413,7 +413,7 @@ OFFLINE_PAIRS = [
         "condition": "infecciones bacterianas del tracto urinario y respiratorio",
         "symptom": "una infección urinaria o respiratoria",
         "brand": "Baycip",
-        "brands": ["Baycip", "Rigoran", "Ciflosin"],
+        "brands": ["Baycip", "Cetraxal", "Ciproquin"],
         "generics": [
             "Ciprofloxacino Cinfa",
             "Ciprofloxacino Normon",

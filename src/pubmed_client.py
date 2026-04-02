@@ -275,12 +275,16 @@ class PubMedClient:
         log.info("  Generic lab-specific: %d results",
                  data.generic_search.total_count)
 
-        # 3. Branded drug — brand name search
+        # 3. Branded drug — search all known brand names for this INN
+        all_brands = pair.get("brands", [brand])
+        if not all_brands:
+            all_brands = [brand]
+        brands_or = " OR ".join(f'"{b}"' for b in all_brands)
         data.brand_search = self.search_and_summarise(
-            f'{brand}[Title/Abstract] AND drug',
+            f'({brands_or})[Title/Abstract] AND drug',
             top_n=top_n,
         )
-        log.info("  Brand '%s': %d results", brand, data.brand_search.total_count)
+        log.info("  Brands %s: %d results", all_brands, data.brand_search.total_count)
 
         # 4. Bioequivalence & comparison articles
         data.bioequivalence_search = self.search_and_summarise(
