@@ -46,9 +46,9 @@ class DrugPairPubMedData:
     pair_id: str
     principio_activo: str
     brand_name: str
-    brand_search: Optional[PubMedSearchResult] = None
     inn_search: Optional[PubMedSearchResult] = None
-    brand_vs_generic_search: Optional[PubMedSearchResult] = None
+    generic_search: Optional[PubMedSearchResult] = None
+    brand_search: Optional[PubMedSearchResult] = None
     bioequivalence_search: Optional[PubMedSearchResult] = None
 
 
@@ -203,10 +203,10 @@ class PubMedClient:
         """Collect PubMed data for a single drug pair.
 
         Runs four searches per pair:
-        1. Brand name search (e.g. "Losec")
-        2. INN search (e.g. "omeprazol")
-        3. Brand vs generic comparison search
-        4. Bioequivalence search
+        1. Active principle (INN) — no dosage (e.g. "omeprazol")
+        2. Generic lab-specific — INN + lab names (e.g. "omeprazol AND (Cinfa OR Normon ...)")
+        3. Branded drug — brand name (e.g. "Losec")
+        4. Bioequivalence & comparison — INN + bioequivalence/comparison terms
         """
         inn = self._extract_inn(pair["principio_activo"])
         brand = pair["brand"]
@@ -220,35 +220,56 @@ class PubMedClient:
 
         log.info("[%s] Searching PubMed for '%s' / '%s'...", pair_id, brand, inn)
 
-        # 1. Brand name — use simple term (no field tag) for broader matching
-        data.brand_search = self.search_and_summarise(
-            f'{brand} AND drug',
-            top_n=top_n,
-        )
-        log.info("  Brand '%s': %d results", brand, data.brand_search.total_count)
-
-        # 2. INN (active ingredient) — broader search without field restriction
+        # 1. Active principle (INN) — plain search, no dosage
         data.inn_search = self.search_and_summarise(
             f'{inn}[Title/Abstract]',
             top_n=top_n,
         )
         log.info("  INN '%s': %d results", inn, data.inn_search.total_count)
 
-        # 3. Brand vs generic
-        data.brand_vs_generic_search = self.search_and_summarise(
-            f'{inn}[Title/Abstract] AND (generic OR brand OR branded) '
-            f'AND (comparison OR equivalence)',
-            top_n=top_n,
-        )
-        log.info("  Brand-vs-generic: %d results",
-                 data.brand_vs_generic_search.total_count)
+        # 2. Generic lab-specific — search INN + laboratory names from generics list
+        generics = pair.get("generics", [])
+        if generics:
+            # Extract lab names (second word onwards, e.g. "Cinfa" from "Paracetamol Cinfa")
+            lab_names = []
+            for g in generics:
+                parts = g.strip().split()
+                if len(parts) >= 2:
+                    lab_names.append(" ".join(parts[1:]))
+            if lab_names:
+                labs_or = " OR ".join(f'"{lab}"' for lab in lab_names)
+                data.generic_search = self.search_and_summarise(
+                    f'{inn}[Title/Abstract] AND ({labs_or})',
+                    top_n=top_n,
+                )
+            else:
+                data.generic_search = self.search_and_summarise(
+                    f'{inn}[Title/Abstract] AND generic',
+                    top_n=top_n,
+                )
+        else:
+            data.generic_search = self.search_and_summarise(
+                f'{inn}[Title/Abstract] AND generic',
+                top_n=top_n,
+            )
+        log.info("  Generic lab-specific: %d results",
+                 data.generic_search.total_count)
 
-        # 4. Bioequivalence
-        data.bioequivalence_search = self.search_and_summarise(
-            f'{inn}[Title/Abstract] AND bioequivalence',
+        # 3. Branded drug — brand name search
+        data.brand_search = self.search_and_summarise(
+            f'{brand}[Title/Abstract] AND drug',
             top_n=top_n,
         )
-        log.info("  Bioequivalence: %d results",
+        log.info("  Brand '%s': %d results", brand, data.brand_search.total_count)
+
+        # 4. Bioequivalence & comparison articles
+        data.bioequivalence_search = self.search_and_summarise(
+            f'{inn}[Title/Abstract] AND (bioequivalence OR bioequivalent '
+            f'OR "therapeutic equivalence" OR "generic comparison" '
+            f'OR "brand vs generic" OR "branded vs generic")',
+            top_n=top_n,
+        )
+        log.info("  Bioequivalence & comparison: %d results",
                  data.bioequivalence_search.total_count)
 
         return data
@@ -330,9 +351,9 @@ def collect_pubmed_for_all_pairs(
             all_articles = []
             queries_used = []
             for search_key, label in [
-                ("brand_search", "brand"),
                 ("inn_search", "inn"),
-                ("brand_vs_generic_search", "brand_vs_generic"),
+                ("generic_search", "generic_lab"),
+                ("brand_search", "brand"),
                 ("bioequivalence_search", "bioequivalence"),
             ]:
                 search = serialised.get(search_key)
