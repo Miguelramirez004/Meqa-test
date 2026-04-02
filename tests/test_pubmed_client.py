@@ -178,6 +178,7 @@ class TestCollectForPair:
             "pair_id": "P01_PARACET",
             "principio_activo": "Paracetamol 1g",
             "brand": "Gelocatil",
+            "brands": ["Gelocatil", "Efferalgan", "Tylenol"],
             "generics": [
                 "Paracetamol Cinfa",
                 "Paracetamol Normon",
