@@ -276,12 +276,14 @@ class PubMedClient:
                  data.generic_search.total_count)
 
         # 3. Branded drug — search all known brand names for this INN
+        #    Apply [Title/Abstract] to EACH term individually; PubMed doesn't
+        #    reliably propagate field tags into parenthetical OR groups.
         all_brands = pair.get("brands", [brand])
         if not all_brands:
             all_brands = [brand]
-        brands_or = " OR ".join(f'"{b}"' for b in all_brands)
+        brands_or = " OR ".join(f'"{b}"[Title/Abstract]' for b in all_brands)
         data.brand_search = self.search_and_summarise(
-            f'({brands_or})[Title/Abstract] AND drug',
+            f'({brands_or}) AND drug',
             top_n=top_n,
         )
         log.info("  Brands %s: %d results", all_brands, data.brand_search.total_count)
