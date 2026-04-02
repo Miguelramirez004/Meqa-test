@@ -173,6 +173,10 @@ class TestCollectForPair:
             "pair_id": "P01_PARACET",
             "principio_activo": "Paracetamol 1g",
             "brand": "Gelocatil",
+            "generics": [
+                "Paracetamol Cinfa",
+                "Paracetamol Normon",
+            ],
         }
 
         mock_resp = MagicMock()
@@ -189,11 +193,11 @@ class TestCollectForPair:
             data = client.collect_for_pair(pair)
 
         assert data.pair_id == "P01_PARACET"
-        assert data.brand_search is not None
         assert data.inn_search is not None
-        assert data.brand_vs_generic_search is not None
+        assert data.generic_search is not None
+        assert data.brand_search is not None
         assert data.bioequivalence_search is not None
-        assert data.brand_search.total_count == 10
+        assert data.inn_search.total_count == 10
 
 
 # ── collect_pubmed_data ──────────────────────────────────────────────
