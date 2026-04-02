@@ -188,15 +188,35 @@ class PubMedClient:
 
     # ── Drug-pair queries ──────────────────────────────────────────────
 
+    # Spanish INN → English INN for PubMed (English-language database).
+    # Only includes names that differ between languages.
+    _INN_ES_TO_EN: dict[str, str] = {
+        "ibuprofeno": "ibuprofen",
+        "amoxicilina": "amoxicillin",
+        "omeprazol": "omeprazole",
+        "atorvastatina": "atorvastatin",
+        "metformina": "metformin",
+        "sertralina": "sertraline",
+        "amlodipino": "amlodipine",
+        "azitromicina": "azithromycin",
+        "simvastatina": "simvastatin",
+        "fluoxetina": "fluoxetine",
+        "diclofenaco": "diclofenac",
+        "pantoprazol": "pantoprazole",
+        "levotiroxina": "levothyroxine",
+        "ciprofloxacino": "ciprofloxacin",
+    }
+
     @staticmethod
     def _extract_inn(principio_activo: str) -> str:
-        """Extract bare INN from principio_activo string.
+        """Extract bare INN from principio_activo string, in English.
 
         'Paracetamol 1g' -> 'paracetamol'
-        'Omeprazol 20mg' -> 'omeprazol'
+        'Omeprazol 20mg' -> 'omeprazole'
         """
         parts = principio_activo.strip().split()
-        return parts[0].lower() if parts else principio_activo.lower()
+        inn_es = parts[0].lower() if parts else principio_activo.lower()
+        return PubMedClient._INN_ES_TO_EN.get(inn_es, inn_es)
 
     def collect_for_pair(self, pair: dict,
                          top_n: int = 5) -> DrugPairPubMedData:

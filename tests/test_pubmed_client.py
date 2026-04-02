@@ -49,16 +49,21 @@ class TestExtractINN:
         assert PubMedClient._extract_inn("Paracetamol 1g") == "paracetamol"
 
     def test_with_dose(self):
-        assert PubMedClient._extract_inn("Omeprazol 20mg") == "omeprazol"
+        assert PubMedClient._extract_inn("Omeprazol 20mg") == "omeprazole"
 
     def test_single_word(self):
-        assert PubMedClient._extract_inn("Ibuprofeno") == "ibuprofeno"
+        assert PubMedClient._extract_inn("Ibuprofeno") == "ibuprofen"
 
     def test_empty(self):
         assert PubMedClient._extract_inn("") == ""
 
     def test_complex(self):
-        assert PubMedClient._extract_inn("Atorvastatina 20mg") == "atorvastatina"
+        assert PubMedClient._extract_inn("Atorvastatina 20mg") == "atorvastatin"
+
+    def test_unchanged_inn(self):
+        """INNs identical in Spanish and English stay as-is."""
+        assert PubMedClient._extract_inn("Enalapril 20mg") == "enalapril"
+        assert PubMedClient._extract_inn("Salbutamol 100mcg") == "salbutamol"
 
 
 # ── esearch ──────────────────────────────────────────────────────────
