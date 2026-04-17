@@ -207,7 +207,7 @@ class TestBrandKnowledgeBase:
     def test_known_brand_for_omeprazol(self):
         brands = BRAND_NAMES_BY_INN["omeprazol"]
         assert "losec" in brands
-        assert "mepral" in brands
+        assert "mopral" in brands
         assert "prilosec" in brands
 
     def test_known_brand_for_atorvastatina(self):
@@ -239,10 +239,10 @@ class TestBroadBrandDetection:
         assert "losec" in found
 
     def test_detects_alternative_brand(self):
-        text = "Mepral también contiene omeprazol como principio activo."
+        text = "Mopral también contiene omeprazol como principio activo."
         positions, found = _find_all_brand_mentions(text, "omeprazol")
         assert len(positions) > 0
-        assert "mepral" in found
+        assert "mopral" in found
 
     def test_detects_international_brand(self):
         text = "Prilosec es la marca comercial en Estados Unidos."
@@ -251,10 +251,10 @@ class TestBroadBrandDetection:
         assert "prilosec" in found
 
     def test_detects_multiple_brands(self):
-        text = "Losec y Mepral son marcas comerciales de omeprazol."
+        text = "Losec y Mopral son marcas comerciales de omeprazol."
         positions, found = _find_all_brand_mentions(text, "omeprazol")
         assert "losec" in found
-        assert "mepral" in found
+        assert "mopral" in found
 
     def test_no_brand_returns_empty(self):
         text = "El omeprazol es un medicamento genérico."
@@ -387,11 +387,11 @@ class TestResponseAnalysis:
         assert metrics["generic_mentioned"] is True  # INN counts as generic
 
     def test_analyze_detects_alternative_brand(self, sample_query):
-        """Should detect Mepral as a brand for omeprazol, not just Losec."""
-        text = "Mepral es otra marca comercial de omeprazol."
+        """Should detect Mopral as a brand for omeprazol, not just Losec."""
+        text = "Mopral es otra marca comercial de omeprazol."
         metrics = analyze_response(text, sample_query)
         assert metrics["brand_mentioned"] is True
-        assert "mepral" in metrics["brand_names_found"]
+        assert "mopral" in metrics["brand_names_found"]
 
     def test_analyze_detects_generic_product(self, sample_query):
         text = "Omeprazol Cinfa es un genérico bioequivalente."
@@ -459,11 +459,11 @@ class TestResponseAnalysis:
 
     def test_multiple_brands_detected(self, sample_query):
         """Multiple brand names for same INN detected."""
-        text = "Losec y Mepral son marcas comerciales de omeprazol."
+        text = "Losec y Mopral son marcas comerciales de omeprazol."
         metrics = analyze_response(text, sample_query)
         assert metrics["brand_mentioned"] is True
         assert "losec" in metrics["brand_names_found"]
-        assert "mepral" in metrics["brand_names_found"]
+        assert "mopral" in metrics["brand_names_found"]
 
     def test_atorvastatina_broad_detection(self):
         """Test broad detection for a different INN."""
