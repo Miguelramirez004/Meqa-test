@@ -57,7 +57,7 @@ OFFLINE_PAIRS = [
         "condition": "dolor leve a moderado y fiebre",
         "symptom": "el dolor de cabeza y la fiebre",
         "brand": "Gelocatil",
-        "brands": ["Gelocatil", "Efferalgan", "Termalgin", "Apiretal", "Dolostop", "Febrectal", "Xumadol", "Antidol", "Tylenol", "Panadol", "Acertol", "Algidol", "Frenadol"],
+        "brands": ["Gelocatil", "Efferalgan", "Termalgin", "Apiretal", "Dolostop", "Febrectal", "Xumadol", "Antidol", "Tylenol", "Panadol", "Acertol", "Frenadol"],
         "generics": [
             "Paracetamol Cinfa",
             "Paracetamol Normon",
@@ -95,7 +95,7 @@ OFFLINE_PAIRS = [
         "condition": "infecciones bacterianas",
         "symptom": "una infección bacteriana",
         "brand": "Clamoxyl",
-        "brands": ["Clamoxyl", "Augmentine", "Ardine", "Amoxaren", "Hosboral"],
+        "brands": ["Clamoxyl", "Ardine", "Amoxaren", "Hosboral"],
         "generics": [
             "Amoxicilina Cinfa",
             "Amoxicilina Normon",
@@ -114,7 +114,7 @@ OFFLINE_PAIRS = [
         "condition": "acidez gástrica y reflujo gastroesofágico",
         "symptom": "la acidez de estómago",
         "brand": "Losec",
-        "brands": ["Losec", "Mopral", "Ulceral", "Prilosec", "Nexium", "Pariet", "Pantecta", "Zurcal", "Lanzol"],
+        "brands": ["Losec", "Mopral", "Ulceral", "Prilosec"],
         "generics": [
             "Omeprazol Cinfa",
             "Omeprazol Normon",
@@ -134,7 +134,7 @@ OFFLINE_PAIRS = [
         "condition": "hipercolesterolemia",
         "symptom": "el colesterol alto",
         "brand": "Lipitor",
-        "brands": ["Lipitor", "Cardyl", "Prevencor", "Zarator", "Crestor"],
+        "brands": ["Lipitor", "Cardyl", "Prevencor", "Zarator"],
         "generics": [
             "Atorvastatina Cinfa",
             "Atorvastatina Normon",
@@ -209,7 +209,7 @@ OFFLINE_PAIRS = [
         "condition": "depresión y trastorno obsesivo-compulsivo",
         "symptom": "la depresión",
         "brand": "Besitran",
-        "brands": ["Besitran", "Aremis"],
+        "brands": ["Besitran", "Aremis", "Zoloft"],
         "generics": [
             "Sertralina Cinfa",
             "Sertralina Normon",
@@ -340,7 +340,7 @@ OFFLINE_PAIRS = [
         "condition": "dolor e inflamación",
         "symptom": "el dolor y la inflamación",
         "brand": "Voltaren",
-        "brands": ["Voltaren", "Artrotec"],
+        "brands": ["Voltaren"],
         "generics": [
             "Diclofenaco Cinfa",
             "Diclofenaco Normon",
@@ -395,7 +395,7 @@ OFFLINE_PAIRS = [
         "condition": "trastorno de ansiedad generalizada",
         "symptom": "la ansiedad",
         "brand": "Trankimazin",
-        "brands": ["Trankimazin", "Tranquimazin Retard"],
+        "brands": ["Trankimazin", "Trankimazin Retard"],
         "generics": [
             "Alprazolam Cinfa",
             "Alprazolam Normon",

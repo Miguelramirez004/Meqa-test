@@ -7,7 +7,7 @@ recognition:
    mentioned by its International Non-proprietary Name (e.g., "omeprazol").
 2. **Brand detection** — Recognises all known commercial brand names for
    the active ingredient in the Spanish market and internationally
-   (e.g., "Losec", "Mepral", "Prilosec").
+   (e.g., "Losec", "Mopral", "Prilosec").
 3. **Generic-product detection** — Detects specific generic products by
    INN + laboratory name (e.g., "Omeprazol Cinfa", "Omeprazol Normon").
 
@@ -33,28 +33,29 @@ from .config import RESPONSES_DIR, ANALYSIS_DIR
 
 BRAND_NAMES_BY_INN = {
     # ── 20 high-volume traditional drugs ──
-    "paracetamol": ["gelocatil", "termalgin", "efferalgan", "apiretal", "dolocatil",
-                    "panadol", "tylenol"],
-    "ibuprofeno": ["nurofen", "espidifen", "dalsy", "dobupal", "bexistar",
-                   "neobrufen", "advil", "motrin", "ibufen", "algidol"],
-    "amoxicilina": ["clamoxyl", "amoxicilina beecham", "amoxil", "augmentine"],
-    "omeprazol": ["losec", "belfa", "mopral", "mepral", "prilosec"],
-    "atorvastatina": ["lipitor", "cardyl", "zarator", "sortis", "torvast", "totalip"],
-    "enalapril": ["renitec", "cardiovasil", "dilvas", "acetensil", "naprilene"],
+    "paracetamol": ["gelocatil", "efferalgan", "termalgin", "apiretal", "dolostop",
+                    "febrectal", "xumadol", "antidol", "tylenol", "panadol",
+                    "acertol", "frenadol"],
+    "ibuprofeno": ["nurofen", "espidifen", "saetil", "dalsy", "algidol",
+                   "advil", "motrin", "brufen"],
+    "amoxicilina": ["clamoxyl", "ardine", "amoxaren", "hosboral"],
+    "omeprazol": ["losec", "mopral", "ulceral", "prilosec"],
+    "atorvastatina": ["lipitor", "cardyl", "prevencor", "zarator"],
+    "enalapril": ["renitec", "dabonal", "acetensil"],
     "metformina": ["dianben", "glucophage"],
-    "lorazepam": ["orfidal", "idalprem", "placinoral"],
+    "lorazepam": ["orfidal", "idalprem"],
     "sertralina": ["besitran", "aremis", "zoloft"],
-    "salbutamol": ["ventolin", "buto asma", "salbulair", "ventolin accuhaler"],
-    "amlodipino": ["norvasc", "astudal", "neotensin", "istin"],
-    "azitromicina": ["zithromax", "vinzam", "toraseptol", "sumamed"],
+    "salbutamol": ["ventolin", "buto asma"],
+    "amlodipino": ["norvasc", "astudal"],
+    "azitromicina": ["zithromax", "toraseptol", "vinzam"],
     "simvastatina": ["zocor", "pantok", "algoren"],
-    "fluoxetina": ["prozac", "adofen", "reneuron"],
-    "ramipril": ["altace", "acovil", "ramicor", "triatec", "tritace"],
-    "diclofenaco": ["voltaren", "artrotec"],
-    "pantoprazol": ["pantoc", "anagastra", "pantoloc", "pantecta", "zurcal"],
-    "levotiroxina": ["eutirox", "levothroid", "synthroid", "levothyrox"],
-    "alprazolam": ["trankimazin", "tranquimazin retard", "xanax"],
-    "ciprofloxacino": ["baycip", "rigoran", "ciflosin", "ciproxin", "cetraxal"],
+    "fluoxetina": ["prozac", "adofen", "reneuron", "luramon"],
+    "ramipril": ["altace", "acovil", "ramicor", "triatec"],
+    "diclofenaco": ["voltaren"],
+    "pantoprazol": ["pantoc", "anagastra", "pantoloc"],
+    "levotiroxina": ["eutirox", "levothroid"],
+    "alprazolam": ["trankimazin", "trankimazin retard"],
+    "ciprofloxacino": ["baycip", "cetraxal", "ciproquin"],
 }
 
 # Common generic pharmaceutical laboratory names in Spain
@@ -371,7 +372,7 @@ def analyze_response(response_text: str, query: dict) -> dict:
 
     Uses broad drug name recognition:
     - INN (active ingredient): e.g., "omeprazol"
-    - Brand names: all known commercial names (e.g., "Losec", "Mepral")
+    - Brand names: all known commercial names (e.g., "Losec", "Mopral")
     - Generic products: INN + lab name (e.g., "Omeprazol Cinfa")
 
     Args:
